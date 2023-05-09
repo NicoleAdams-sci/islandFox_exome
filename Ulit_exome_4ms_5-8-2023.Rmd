@@ -1,0 +1,3337 @@
+---
+title: "Ulit_exome_4ms_5-8-2023"
+author: "Nicole Adams"
+date: '2023-05-08'
+output: 
+  html_document:
+    toc: true
+    code_folding: show
+---
+
+# Preamble
+This document contains code (linux and R) for the paper "Genomic recovery lags behind demographic recovery in bottlenecked populations of the Channel Island fox, *Urocyon littoralis*" by Adams and Edmands *Molecular Ecology* 2023. Raw sequences (fastq files) from targeted exome sequencing can be found in BioProject PRJNA970412 at NCBI's Sequence Read Archive.
+
+&nbsp;
+
+We extracted whole genomic DNA from historical samples (dried tissue from bones or 1x1cm section of ventral skin) and from modern blood samples. Libraries were made with exome capture baits (NimbleGen’s SeqCap EZ Developer) based on a domestic dog design by Broeckx et al. (2014). The exome capture protocol was carried out based on NimbleGen SeqCap EZ Library SR User’s Guide (Roche NimbleGen, Madison, WI, USA). Four barcoded sample libraries were pooled per one exome capture then three amplified and quality checked exome captures were pooled equimolarly. A total of 24 exome captures were sequenced by 150bp paired-end reads on 8 lanes of an Illumina HiSeq X at Fulgent Genetics (Temple City, CA, USA).
+
+&nbsp;
+&nbsp;
+
+# Sample metadata
+## Load in R libraries
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse)  # data wrangling
+library(data.table)  # fread() (read in data)
+library(readxl) # read in Excel sheets
+library(ggpubr)  # combine plots
+library(ggrepel) # labeling plot points
+library(broom) # tidy stats results
+
+library(multcomp) # GLM for heterozygosity
+library(rstatix) # Calculate effect size
+library(windowscanr) # sliding window analysis
+library(gap) # genomic control based on p values for association tests
+library(raster) # sample map
+library(ggthemes) # sample map
+library(ggsn) # sample map
+
+```
+
+&nbsp;
+
+## Load in sample metadata and tidy
+One sample (SCL_40749) was mislabeled during DNA extraction as SCL, but is from SNI. Changed label to SNI_SCL_40749 in metadata and for analyses
+```{r, warning=FALSE, message=FALSE}
+mydata <- read.table("~/Desktop/Ulit/exome/ExomeSamples_Meta_2-7-2023.csv", header=TRUE, sep=",")
+
+mydata$ISLAND <- factor(mydata$ISLAND, levels=c("SMI", "SRI", "SCZ", "CAT", "SCL", "SNI"))
+
+```
+
+&nbsp;
+&nbsp;
+
+# 1) Trim and filter reads with AdapterRemoval
+Batch script for AdapterRemoval to remove any adapters, trim based on quality, and collapse paired end reads (~/scripts/Ulit/adapterRemoval.sbatch)
+```{bash, eval=FALSE, message=FALSE}
+#!/bin/bash
+#SBATCH --job-name=trim
+#SBATCH --output=/ocean/projects/mcb200015p/adamsne2/UlitExome/fastqs/trimd/TRIM.%j.out
+#SBATCH --error=/ocean/projects/mcb200015p/adamsne2/UlitExome/fastqs/trimd/TRIM.%j.err
+#SBATCH -t 00:30:00
+#SBATCH -p RM-shared
+##SBATCH -N 1
+#SBATCH --ntasks-per-node 8
+##SBATCH --mem=128G
+#SBATCH -A xxx
+#SBATCH --mail-type=END
+
+sample=$1
+
+# define directory
+fastq="/ocean/projects/mcb200015p/adamsne2/UlitExome/fastqs"
+
+# 1) trim and collapse PE reads with AdapterRemoval
+~/programs/adapterremoval-2.3.1/build/AdapterRemoval --file1 $fastq/$sample\_R1_001.fastq.gz --file2  $fastq/$sample\_R2_001.fastq.gz --basename trimd/$sample\_paired --trimns --trimqualities --minlength 35 --minquality 20 --collapse --threads 8
+
+
+```
+
+&nbsp;
+
+## Loop to run AdapterRemoval batch script
+```{bash, eval=FALSE, message=FALSE}
+cd /ocean/projects/mcb200015p/adamsne2/UlitExome/fastqs
+
+# test one sample
+for sample in `ls LANHM-085730_S78_L007_R1_001.fastq.gz | cut -f1,2,3 -d '_'`; do echo $sample; sbatch ~/scripts/Ulit/adapterRemoval.sbatch $sample; done
+
+# run all
+for sample in `ls *_R1_001.fastq.gz | grep -v "LANHM-085730" | cut -f1,2,3 -d '_'`; do echo $sample; sbatch ~/scripts/Ulit/adapterRemoval.sbatch $sample; done
+```
+
+&nbsp;
+&nbsp;
+
+# 2) Map reads with bwa aln
+Batch script to map samples to dog reference using bwa aln (~/scripts/Ulit/bwa_aln.sbatch)
+```{bash, eval=FALSE, message=FALSE}
+#!/bin/bash
+#SBATCH --job-name=aln
+#SBATCH --output=/ocean/projects/mcb200015p/adamsne2/UlitExome/bwaMap/aln.%j.out
+#SBATCH --error=/ocean/projects/mcb200015p/adamsne2/UlitExome/bwaMap/aln.%j.err
+#SBATCH -t 08:00:00
+#SBATCH -p RM
+##SBATCH -N 1
+#SBATCH --ntasks-per-node 128
+##SBATCH --mem=128G
+#SBATCH -A xxx
+#SBATCH --mail-type=END
+
+module load BWA/0.7.3a
+
+sample=$1
+sample2=$2
+
+REFERENCE="/ocean/projects/mcb200015p/adamsne2/UlitExome/reference/canFam3.fa.gz"
+
+#cd /ocean/projects/mcb200015p/adamsne2/UlitExome/fastqs/trimd
+
+# 2) bwa aln
+bwa aln -t 128 $REFERENCE $sample > ../../bwaMap/$sample2\_paired.collapsed.sai
+
+
+```
+
+&nbsp;
+
+## Loop to run bwa aln batch script
+```{bash, eval=FALSE, message=FALSE}
+cd /ocean/projects/mcb200015p/adamsne2/UlitExome/fastqs/trimd/
+
+# test one sample
+for sample in `ls LANHM-006843_S59_L005_paired.collapsed`; do sample2=`ls $sample | cut -f1 -d '_'`; echo $sample $sample2; sbatch ~/scripts/Ulit/bwa_aln.sbatch $sample $sample2; done
+
+# run all
+for sample in `ls *_paired.collapsed | grep -v "LANHM-006843"`; do sample2=`ls $sample | cut -f1 -d '_'`; echo $sample $sample2; sbatch ~/scripts/Ulit/bwa_aln.sbatch $sample $sample2; done
+```
+
+&nbsp;
+&nbsp;
+
+# 3) Generate SAM files with bwa samse
+Batch script to generate SAM files from the collapsed read alignments (~/scripts/Ulit/bwa_samse.sbatch)
+```{bash, eval=FALSE, message=FALSE}
+#!/bin/bash
+#SBATCH --job-name=samse
+#SBATCH --output=/ocean/projects/mcb200015p/adamsne2/UlitExome/bwaMap/samse.%j.out
+#SBATCH --error=/ocean/projects/mcb200015p/adamsne2/UlitExome/bwaMap/samse.%j.err
+#SBATCH -t 02:00:00
+#SBATCH -p RM-shared
+##SBATCH -N 1
+#SBATCH --ntasks-per-node 8
+##SBATCH --mem=128G
+#SBATCH -A xxx
+#SBATCH --mail-type=END
+
+module load BWA/0.7.3a
+
+sample=$1
+sample2=$2
+
+REFERENCE="/ocean/projects/mcb200015p/adamsne2/UlitExome/reference/canFam3.fa.gz"
+
+
+# 3) bwa samse
+bwa samse -r "@RG\tID:$sample2\tPL:illumina\tLB:$sample2\tSM:$sample2" $REFERENCE ../../bwaMap/$sample2\_paired.collapsed.sai $sample > ../../bwaMap/$sample2\_paired.collapsed.sam
+
+
+```
+
+&nbsp;
+
+## Loop to run bwa samse batch script
+```{bash, eval=FALSE, message=FALSE}
+cd /ocean/projects/mcb200015p/adamsne2/UlitExome/fastqs/trimd/
+
+# test one sample
+for sample in `ls LANHM-006843_S59_L005_paired.collapsed`; do sample2=`ls $sample | cut -f1 -d '_'`; echo $sample $sample2; sbatch ~/scripts/Ulit/bwa_samse.sbatch $sample $sample2; done
+
+# run all
+for sample in `ls *_paired.collapsed | grep -v "LANHM-006843"`; do sample2=`ls $sample | cut -f1 -d '_'`; echo $sample $sample2; sbatch ~/scripts/Ulit/bwa_samse.sbatch $sample $sample2; done
+
+```
+
+&nbsp;
+&nbsp;
+
+# 4-5) Convert SAM to BAM and validate bam file
+Convert SAM file to BAM file using samtools then validate (~/scripts/Ulit/sam2bam.sbatch)
+```{bash, eval=FALSE, message=FALSE}
+#!/bin/bash
+#SBATCH --job-name=sam2bam
+#SBATCH --output=sam2bam.%j.out
+#SBATCH --error=sam2bam.%j.err
+#SBATCH -t 02:00:00
+#SBATCH -p RM-shared
+##SBATCH -N 1
+#SBATCH --ntasks-per-node 8
+##SBATCH --mem=128G
+#SBATCH -A xxx
+#SBATCH --mail-type=END
+
+
+module load samtools/1.13.0
+module load picard/2.23.2
+
+sample=$1
+sample2=$2
+
+# 4) convert sam to bam and sort
+samtools sort -@8 -o $sample2\_paired.collapsed.bam $sample
+
+# 5) validate bam
+java -jar /jet/home/adamsne2/programs/picard.jar ValidateSamFile I=$sample2\_paired.collapsed.sam MODE=VERBOSE > $sample2.validate
+
+```
+
+&nbsp;
+
+## Loop to run sam2bam batch script
+```{bash, eval=FALSE, message=FALSE}
+cd /ocean/projects/mcb200015p/adamsne2/UlitExome/bwaMap/
+
+# test one sample
+for sample in `ls LANHM-062837_paired.collapsed.sam | grep -v "CAT-58-B0F74"`; do sample2=`ls $sample | cut -f1 -d '_'`; echo $sample $sample2; sbatch ~/scripts/Ulit/sam2bam.sbatch $sample $sample2; done
+
+# run all
+for sample in `ls *_paired.collapsed.sam | grep -v "LANHM-062837"`; do sample2=`ls $sample | cut -f1 -d '_'`; echo $sample $sample2; sbatch ~/scripts/Ulit/sam2bam.sbatch $sample $sample2; done
+
+
+```
+
+&nbsp;
+&nbsp;
+
+# 6) Generate mapping summary
+Generate mapping summary using samtools flagstat then consolidate results (~/scripts/Ulit/sam.flagstat2.sbatch)
+```{bash, eval=FALSE, message=FALSE}
+#!/bin/bash
+#SBATCH --job-name=map_sum
+#SBATCH --output=map-sum.%j.out
+#SBATCH --error=map-sum.%j.err
+#SBATCH -t 02:00:00
+#SBATCH -p RM-shared
+##SBATCH -N 1
+#SBATCH --ntasks-per-node 4
+##SBATCH --mem=128G
+#SBATCH -A xxx
+#################
+#get emailed about job BEGIN, END, and FAIL
+#SBATCH --mail-type=END
+
+
+module load samtools/1.11.0
+
+#cd /ocean/projects/mcb200015p/adamsne2/UlitExome/bwaMap/
+
+touch mapSummary_Ulit_aln.txt
+
+for sample in `ls *_paired.collapsed.bam | cut -f1 -d'_'`
+do
+  samtools flagstat "$sample"\_paired.collapsed.bam -@ 3  > "$sample"_mapSum.txt
+ awk 'FNR == 1{ print FILENAME }' "$sample"_mapSum.txt >> mapSummary_Ulit_aln.txt
+ cat "$sample"_mapSum.txt >> mapSummary_Ulit_aln.txt
+
+done
+
+for sample in *mapSum.txt; do awk 'FNR == 1{ print FILENAME } {printf "%-20s %-40s\n", $1, $3}' OFS="\t" $sample | awk '
+{
+    for (i=1; i<=NF; i++)  {
+        a[NR,i] = $i
+    }
+}
+NF>p { p = NF }
+END {
+    for(j=1; j<=p; j++) {
+        str=a[1,j]
+        for(i=2; i<=NR; i++){
+            str=str" "a[i,j];
+        }
+        print str
+    }
+}' >> mapSummary_Ulit_aln.2.txt; done
+
+grep '_mapSum.txt' mapSummary_Ulit_aln.2.txt > mapSummary_Ulit_aln.3.txt
+
+rm *_mapSum.txt
+
+```
+
+&nbsp;
+
+## Mapping summary
+Look at mapping summary statistics in R
+```{r, warning=FALSE, message=FALSE}
+# load metadata and change delimiter to match sequence names
+mydata <- read.table("~/Desktop/Ulit/exome/ExomeSamples_Meta_2-7-2023.csv", header=TRUE, sep=",")
+mydata$Sample_ID <- gsub("_", "-",  mydata$Sample_ID)
+mydata$ISLAND <- factor(mydata$ISLAND, levels=c("SMI", "SRI", "SCZ", "CAT", "SCL", "SNI"))
+
+# load in mapping summary statistics and tidy
+msum <- read.table("~/Desktop/Ulit/exome/mapSummary_Ulit_aln.3.txt")
+
+colnames(msum) <- c("Sample", "QCpassedReads", "secondary", "supplementary", "duplicates", "mapped", "paired", "read1", "read2", "properlyPaired", "itselfYmateMapped", "singletons", "mateMappedDiffChr", "mateMappedDiffChr_mapQ5")
+
+msum <- msum %>% separate(Sample, c("Sample", "file"), sep = "_") %>% dplyr::select( -file)
+
+# Calculate percentages
+msum$percentMap <- (msum$mapped/msum$QCpassedReads)*100
+msum$percentPaired <- (msum$properlyPaired/msum$paired)*100
+msum$percentSingle <- (msum$singletons/msum$properlyPaired)*100
+
+# merge mapping summary with meta data and fix sample name
+msum$Sample_ID <- msum$Sample
+msum$Sample_ID <- gsub("SCL-40749", "SNI-SCL-40749", msum$Sample_ID)
+msum.meta2 <- inner_join(mydata, msum, by="Sample_ID")
+
+hist(msum$percentMap)
+
+# summary
+#msum %>% summarise(mean=mean(percentMap), sd=sd(percentMap), min=min(percentMap), max=max(percentMap))
+
+msum.meta2 %>% group_by(ISLAND, Time) %>% summarise(n=n(), mean=mean(percentMap), std=sd(percentMap))
+
+#msum.meta2 %>% group_by(ISLAND, Time) %>% summarise(n=n(), mean=mean(mapped), std=sd(mapped))
+
+# find low mapping samples
+low.map <- msum %>% filter(percentMap < 50) %>% arrange(percentMap) # N=10; 4<10%
+
+# get avg w/o low mapping samples
+hi.map <- msum.meta2 %>% filter(percentMap > 10) %>% group_by(ISLAND, Time) %>% summarise(n=n(), mean=mean(percentMap), std=sd(percentMap))
+
+
+```
+
+&nbsp;
+&nbsp;
+
+# 7) Evaluate DNA damage with mapDamage
+Batch script to evaluate common signatures of DNA damage using mapDamage (~/scripts/Ulit/mapDamage.sbatch)
+```{bash, eval=FALSE, message=FALSE}
+#!/bin/bash
+#SBATCH --job-name=mapDam
+#SBATCH --output=mapDam.%j.out
+#SBATCH --error=mapDam.%j.err
+#SBATCH -t 02:00:00
+#SBATCH -p RM-shared
+##SBATCH -N 1
+##SBATCH --ntasks-per-node 8
+##SBATCH --mem=128G
+#SBATCH -A xxx
+#SBATCH --mail-type=END
+
+
+sample=$1
+sample2=$2
+
+module load gcc/10.2.0
+
+REF="/ocean/projects/mcb200015p/adamsne2/UlitExome/reference/canFam3.fa"
+
+~/programs/mapDamage-2.2.1/bin/mapDamage -r $REF -i $sample --folder "$sample2"_mapDamage 
+
+```
+
+&nbsp;
+
+## Loop to run mapDamage batch script
+```{bash, eval=FALSE, message=FALSE}
+for sample in `ls LANHM-062837_paired.collapsed.bam`; do sample2=`ls $sample | cut -f1 -d '_'`; echo $sample $sample2; sbatch ~/scripts/Ulit/mapDamage.sbatch $sample $sample2; done
+
+# run all
+for sample in `ls *_paired.collapsed.bam | grep -v "LANHM-062837"`; do sample2=`ls $sample | cut -f1 -d '_'`; echo $sample $sample2; sbatch ~/scripts/Ulit/mapDamage.sbatch $sample $sample2; done
+
+```
+
+&nbsp;
+
+### Combine mapDamage results in Rstudio -- Figure S1
+Combine G->A and C->T substitution data across all samples
+```{r, warning=FALSE, message=FALSE}
+# load in meta data, make column names similar to join with below data, and clean up sample names
+mydata <- read.table("~/Desktop/Ulit/exome/ExomeSamples_Meta_2-7-2023.csv", header=TRUE, sep=",")
+mydata$ISLAND <- factor(mydata$ISLAND, levels=c("SMI", "SRI", "SCZ", "CAT", "SCL", "SNI"))
+mydata <- mydata %>% rename("sample"="Sample_ID", "island"="ISLAND")
+mydata$sample <- gsub("_", "-", mydata$sample) 
+
+
+# 3pGtoA
+g2a.files <- dir("~/Desktop/Ulit/exome/mapDamage/mapDamageOut/bwaAlnBams", recursive=TRUE, full.names=TRUE, pattern="3pGtoA")
+
+g2a.list <- list()
+for (FILE in g2a.files){
+  g2a.dfA <- as.data.frame(fread(FILE))
+  sampNam <- unlist(strsplit(FILE, "[/|,.,_]+"))[c(10)]
+  dfName <- paste( sampNam, 'g2a.df', sep = '.' )
+  g2a.dfA$sample <- sampNam
+  
+  if(sampNam == "SCL-40749"){
+    g2a.dfA$sample <- gsub("SCL-40749", "SNI-SCL-40749", g2a.dfA$sample)
+  }
+  
+  g2a.df <- left_join(g2a.dfA, mydata, by=c("sample")) %>% dplyr::select(-c(Sample, Lat, Long))
+
+  g2a.list[[dfName]] <- g2a.df
+}
+  
+g2a.all <- rbindlist(g2a.list)
+
+g2a.all$time <- as.factor(g2a.all$time)
+
+# remove the duplicate samples
+g2a.all <- g2a.all %>% filter(!sample %in% c("CAT-59-1477A-2", "LANHM-007959-2", "SRI-16123-2"))
+
+g2a.p <- ggplot(g2a.all, aes(x=pos, y=`3pG>A`)) +
+  geom_path(color="gray", alpha=0.1) +
+  stat_summary(geom="line", fun = "mean", size=0.5, aes(color=Time, linetype=Time)) +
+  ylim(0, 0.3) + # to match the MapDamage default plots
+  xlab("position") +
+  ylab("G to A substitutions - 3'") +
+  theme_minimal() +
+  theme(text = element_text(size = 16))
+
+  
+# 5pCtoT
+c2t.files <- dir("~/Desktop/Ulit/exome/mapDamage/mapDamageOut/bwaAlnBams", recursive=TRUE, full.names=TRUE, pattern="5pCtoT")
+
+c2t.list <- list()
+for (FILE in c2t.files){
+  c2t.dfA <- as.data.frame(fread(FILE))
+  sampNam <- unlist(strsplit(FILE, "[/|,.,_]+"))[c(10)]
+  dfName <- paste( sampNam, 'c2t.df', sep = '.' )
+  c2t.dfA$sample <- sampNam
+  
+  if(sampNam == "SCL-40749"){
+    c2t.dfA$sample <- gsub("SCL-40749", "SNI-SCL-40749", c2t.dfA$sample)
+  }
+  
+  c2t.df <- left_join(c2t.dfA, mydata, by=c("sample")) %>% dplyr::select(-c(Sample, Lat, Long))
+
+  c2t.list[[dfName]] <- c2t.df
+}
+  
+c2t.all <- rbindlist(c2t.list)
+
+c2t.all$time <- as.factor(c2t.all$time)
+
+# remove the duplicate samples
+c2t.all <- c2t.all %>% filter(!sample %in% c("CAT-59-1477A-2", "LANHM-007959-2", "SRI-16123-2"))
+
+c2t.p <- ggplot(c2t.all, aes(x=pos, y=`5pC>T`)) +
+  geom_path(color="gray", alpha=0.1) +
+  stat_summary(geom="line", fun = "mean", size=0.5, aes(color=Time, linetype=Time)) +
+  ylim(0, 0.3) + # to match the MapDamage default plots
+  xlab("position") +
+  ylab("C to T substitutions - 5'") +
+  theme_minimal() +
+  theme(text = element_text(size = 16))
+
+mapDam.p <- ggarrange(g2a.p, c2t.p, common.legend = TRUE, legend = "bottom", labels = "AUTO")
+
+#ggsave(filename="~/Desktop/Ulit/exome/mapDamage/mapDamageOut/bwaAlnBams/bwaAln_mapDamage_1-6-23.png", width=10, height=6, units="in",mapDam.p)
+
+mapDam.p
+
+```
+
+&nbsp;
+&nbsp;
+
+# 8) Filter BAMs
+Batch script to filter out unmapped reads from BAM files(~/scripts/Ulit/filterBams.sbatch)
+```{bash, eval=FALSE, message=FALSE}
+#!/bin/bash
+#SBATCH --job-name=filterBam
+#SBATCH --output=filterBam.%j.out
+#SBATCH --error=filterBam.%j.err
+#SBATCH -t 02:00:00
+#SBATCH -p RM-shared
+##SBATCH -N 1
+#SBATCH --ntasks-per-node 8
+##SBATCH --mem=128G
+#SBATCH -A xxx
+#SBATCH --mail-type=END
+
+module load samtools/1.13.0
+
+sample=$1
+sample2=$2
+
+
+samtools view -bF 4 $sample > $sample2\_paired.collapsed.keep.bam
+
+```
+
+&nbsp;
+
+## Loop to filter BAMs
+```{bash, eval=FALSE, message=FALSE}
+# test one sample
+for sample in `ls LANHM-062837_paired.collapsed.bam`; do sample2=`ls $sample | cut -f1 -d '_'`; echo $sample $sample2; sbatch ~/scripts/Ulit/filterBams.sbatch $sample $sample2; done
+
+# run all
+for sample in `ls *_paired.collapsed.bam | grep -v "LANHM-062837"`; do sample2=`ls $sample | cut -f1 -d '_'`; echo $sample $sample2; sbatch ~/scripts/Ulit/filterBams.sbatch $sample $sample2; done
+
+
+```
+
+&nbsp;
+&nbsp;
+
+# 9) Mark duplicates 
+Batch script to mark duplicates using Picard Tools (~/scripts/markDups.sbatch)
+```{bash, eval=FALSE, message=FALSE}
+#!/bin/bash
+#SBATCH --job-name=mrkdup
+#SBATCH --output=mrkdup.%j.out
+#SBATCH --error=mrkdup.%j.err
+#SBATCH -t 4:00:00
+#SBATCH -p RM-shared
+#SBATCH -N 1
+##SBATCH --ntasks-per-node 1
+##SBATCH --mem=128G
+#SBATCH -A xxx
+#SBATCH --mail-type=END
+
+sample=$1
+sample2=$2
+
+module load samtools/1.11.0
+module load GATK/4.1.9.0
+
+#cd /ocean/projects/mcb200015p/adamsne2/UlitExome/bwaMap
+
+java -jar /jet/home/adamsne2/programs/picard.jar MarkDuplicates \
+      I="$sample" \
+      O="$sample2"_paired.collapsed.keep.mrkdup.bam \
+      M="$sample2".mrkdup_metrics.txt
+
+samtools index "$sample2"_paired.collapsed.keep.mrkdup.bam
+
+```
+
+&nbsp;
+
+## Loop to mark duplicates
+```{bash, eval=FALSE, message=FALSE}
+# test one sample
+for sample in `ls LANHM-062837_paired.collapsed.keep.bam`; do sample2=`ls $sample | cut -f1 -d '_'`; echo $sample $sample2; sbatch ~/scripts/Ulit/markDups.sbatch $sample $sample2; done
+
+# all samples
+for sample in `ls *_paired.collapsed.keep.bam | grep -v "LANHM-062837" `; do sample2=`ls $sample | cut -f1 -d '_'`; echo $sample $sample2; sbatch ~/scripts/Ulit/markDups.sbatch $sample $sample2; done
+
+
+```
+
+&nbsp;
+
+### Combine mark duplicate results 
+Bash code to combine markDuplicate summaries
+```{bash, eval=FALSE, message=FALSE}
+touch Ulit_mrkdup_metrics.txt
+
+for sample in SNI-76917_paired.collapsed.keep.mrkdup.bam.mrkdup_metrics.txt ; do awk 'FNR == 8 {print}' $sample; done
+
+for sample in *.mrkdup_metrics.txt; do awk 'FNR == 8 {print}' $sample /dev/null >> Ulit_mrkdup_metrics.txt; done
+```
+
+&nbsp;
+
+### Evaluate combined mark duplicate results in Rstudio
+```{r, warning=FALSE, message=FALSE}
+# Load metadata and tidy 
+mydata <- read.table("~/Desktop/Ulit/exome/ExomeSamples_Meta_2-7-2023.csv", header=TRUE, sep=",")
+mydata$Sample_ID <- gsub("_", "-",  mydata$Sample_ID)
+mydata$ISLAND <- factor(mydata$ISLAND, levels=c("SMI", "SRI", "SCZ", "CAT", "SCL", "SNI"))
+
+# Load duplicate summaries and tidy
+dups <- as.data.frame(read_tsv("~/Desktop/Ulit/exome/Ulit_mrkdup_metrics.txt", col_names = FALSE))
+
+colnames(dups) <- c("LIBRARY", "UNPAIRED_READS_EXAMINED", "READ_PAIRS_EXAMINED", "SECONDARY_OR_SUPPLEMENTARY_RDS", "UNMAPPED_READS", "UNPAIRED_READ_DUPLICATES", "READ_PAIR_DUPLICATES", "READ_PAIR_OPTICAL_DUPLICATES", "PERCENT_DUPLICATION", "ESTIMATED_LIBRARY_SIZE")
+
+# dups <- dups %>% separate(LIBRARY, c("Sample", "stuff1", "stuff2", "stuff3", "file", "library1")) %>% subset(select=-c(stuff1, stuff2, stuff3, file, library1))
+ 
+ hist(dups$PERCENT_DUPLICATION)
+ 
+ # dups %>% summarise(mean=mean(PERCENT_DUPLICATION), sd=sd(PERCENT_DUPLICATION))
+ 
+ # combine duplicate data with metadata
+ dups <- dups %>% mutate(Sample_ID=LIBRARY)
+ dups$Sample_ID <- gsub("SCL-40749", "SNI-SCL-40749", dups$Sample_ID)
+
+ dup.meta <- left_join(dups, mydata, by="Sample_ID")
+
+ 
+ p.dups <- ggplot(dup.meta %>% filter(!is.na(ISLAND)), aes(x=ISLAND, y=PERCENT_DUPLICATION, fill=Time)) + 
+  geom_boxplot( alpha=0.5, show.legend = T) +
+  scale_fill_viridis_d( option = "cividis") +
+  theme_minimal() 
+
+ 
+ dup.meta %>% group_by(Time) %>% summarise(mean=mean(PERCENT_DUPLICATION), sd=sd(PERCENT_DUPLICATION))
+
+
+```
+
+&nbsp;
+&nbsp;
+
+# 10) Remove duplicates
+Batch script to remove duplicates using Picard Tools (~/scripts/markDups.sbatch)
+```{bash, eval=FALSE, message=FALSE}
+#!/bin/bash
+#SBATCH --job-name=mrkdup
+#SBATCH --output=mrkdup.%j.out
+#SBATCH --error=mrkdup.%j.err
+#SBATCH -t 4:00:00
+#SBATCH -p RM-shared
+#number of nodes- for RM-shared -N 1
+#SBATCH -N 1
+##SBATCH --ntasks-per-node 1
+##SBATCH --mem=128G
+#SBATCH -A xxx
+#SBATCH --mail-type=END
+
+
+sample=$1
+sample2=$2
+
+module load samtools/1.11.0
+module load GATK/4.1.9.0
+
+#cd /ocean/projects/mcb200015p/adamsne2/UlitExome/bwaMap
+
+java -jar /jet/home/adamsne2/programs/picard.jar MarkDuplicates \
+      I="$sample" \
+      O="$sample2"_paired.collapsed.keep.rmdup.bam \
+      M="$sample2".rmdup_metrics.txt \
+      REMOVE_DUPLICATES=true
+
+samtools index "$sample2"_paired.collapsed.keep.rmdup.bam
+
+```
+
+&nbsp;
+
+## Loop to remove duplicates
+```{bash, eval=FALSE, message=FALSE}
+# test one sample
+for sample in `ls LANHM-062837_paired.collapsed.keep.bam`; do sample2=`ls $sample | cut -f1 -d '_'`; echo $sample $sample2; sbatch ~/scripts/Ulit/markDups.sbatch $sample $sample2; done
+
+# all samples
+for sample in `ls *_paired.collapsed.keep.bam | grep -v "LANHM-062837" `; do sample2=`ls $sample | cut -f1 -d '_'`; echo $sample $sample2; sbatch ~/scripts/Ulit/markDups.sbatch $sample $sample2; done
+
+
+```
+
+&nbsp;
+
+# 11) Evaluate mapped, filtered data
+## Evaluate read length
+Batch script to evaluate read length (~/scripts/Ulit/readLength.sbatch)
+```{bash, eval=FALSE, message=FALSE}
+#!/bin/bash
+#SBATCH --job-name=readLength
+#SBATCH --output=readLength.%j.out
+#SBATCH --error=readLength.%j.err
+#SBATCH -t 00:10:00
+#SBATCH -p RM-shared
+##SBATCH -N 1
+#SBATCH --ntasks-per-node 2
+##SBATCH --mem=128G
+#SBATCH -A xxx
+#SBATCH --mail-type=END
+
+
+module load samtools/1.11.0
+
+sample=$1
+sample2=$2
+
+samtools stats -@ 2 $sample > $sample2.samStats.txt
+
+```
+
+&nbsp;
+
+### Loop to evalute read length then combine results
+```{bash, eval=FALSE, message=FALSE}
+for sample in `ls LANHM-062837_paired.collapsed.keep.rmdup.bam`; do sample2=`ls $sample | cut -f1 -d '_'`; echo $sample $sample2; sbatch ~/scripts/Ulit/readLength.sbatch $sample $sample2; done
+
+# run all
+for sample in `ls *.keep.rmdup.bam`; do sample2=`ls $sample | cut -f1 -d '_'`; echo $sample $sample2; sbatch ~/scripts/Ulit/readLength.sbatch $sample $sample2; done
+
+# gather avg read length data
+mv *.samStats.txt samStats/
+touch samStats/samStats.all.txt
+
+for FILE in *.samStats.txt
+do
+ind=$(echo $FILE | awk -F "." '{print $1}'| awk -F "_" '{print $1}')
+res=$(cat $FILE | grep 'average length:')
+echo $ind $res >> samStats.all.txt
+done
+
+```
+
+&nbsp;
+
+#### Evaluate read length in Rstudio -- Part of Table S2
+```{r, warning=FALSE, message=FALSE}
+# Load in metadata and tidy
+mydata <- read.table("~/Desktop/Ulit/exome/ExomeSamples_Meta_2-7-2023.csv", header=TRUE, sep=",")
+mydata$Sample_ID <- gsub("_", "-",  mydata$Sample_ID)
+mydata$ISLAND <- factor(mydata$ISLAND, levels=c("SMI", "SRI", "SCZ", "CAT", "SCL", "SNI"))
+
+# Load in read length data
+sam.df <- read.delim("~/Desktop/Ulit/exome/samStats.all.txt", header = F)
+
+sam.df <- sam.df %>% separate(V1, into = c("Sample_ID", "stuff1", "stuff2", "stuff3", "avgReadLength"), sep = " ") %>% dplyr::select(Sample_ID, avgReadLength)
+
+sam.df$Sample_ID <- gsub("SCL-40749", "SNI-SCL-40749", sam.df$Sample_ID)
+
+
+
+sam.df2 <- left_join(sam.df, mydata, by="Sample_ID")
+
+sam.df2 <- sam.df2 %>% mutate(avgReadLength=as.numeric(avgReadLength))
+
+# summary
+sam.tab <- sam.df2 %>% group_by(ISLAND, Time) %>% summarise(n=n(), mean=mean(avgReadLength), sd=sd(avgReadLength))
+
+sam.df2 %>% group_by(Time) %>% summarise(n=n(), mean=mean(avgReadLength), sd=sd(avgReadLength))
+
+rL.p <- ggpubr::ggline(sam.df2, x = "ISLAND", y = "avgReadLength", 
+       add = c("mean_se", "jitter"), 
+       ylab = "Avg Read Length", xlab = "Island")
+
+rL.p2 <- ggpubr::ggline(sam.df2, x = "Time", y = "avgReadLength", 
+       add = c("mean_se", "jitter"), 
+       order = c("Historical", "Modern"),
+       ylab = "Avg Read Length", xlab = "Time")
+
+rL.p2
+
+#kruskal.test(avgReadLength ~ ISLAND, data=sam.df2) # not signif
+kruskal.test(avgReadLength ~ Time, data=sam.df2) # yes signif
+
+```
+
+&nbsp;
+&nbsp;
+
+## Estimate on target percent with Picard Tools
+### Convert bed files to interval list files for capture and primary targets
+```{bash, eval=FALSE, message=FALSE}
+cd /reference/
+
+java -jar /jet/home/adamsne2/programs/picard.jar BedToIntervalList \
+      I=canFam3_exomeplus_BB_EZ_HX1_capture_targets_coord.bed \
+      O=canFam3_exomeplus_BB_EZ_HX1_capture_targets_coord.interval_list \
+      SD=canFam3.fa.dict
+      
+java -jar /jet/home/adamsne2/programs/picard.jar BedToIntervalList \
+      I=canFam3_exomeplus_BB_EZ_HX1_primary_targets_coord.bed \
+      O=canFam3_exomeplus_BB_EZ_HX1_primary_targets_coord.interval_list \
+      SD=canFam3.fa.dict
+
+```
+
+&nbsp;
+
+### Calculate on target summary
+Batch script to calculate on target summary with hsMetrics (~/scripts/Ulit/hsMetrics.sbatch)
+```{bash, eval=FALSE, message=FALSE}
+#!/bin/bash
+#SBATCH --job-name=hsMetrics
+#SBATCH --output=hsMetrics.%j.out
+#SBATCH --error=hsMetrics.%j.err
+#SBATCH -t 4:00:00
+#SBATCH -p RM-shared
+#SBATCH -N 1
+##SBATCH --ntasks-per-node 2
+##SBATCH --mem=4G
+#SBATCH -A xxx
+#SBATCH --mail-type=END
+
+
+FILE=$1
+
+java -Xmx50g -Xms50g -jar /jet/home/adamsne2/programs/picard.jar CollectHsMetrics \
+I=$FILE O=onTarget/${FILE%%.*}.hsMetrics.txt \
+R="/ocean/projects/mcb200015p/adamsne2/UlitExome/reference/canFam3.fa.gz" \
+BAIT_INTERVALS=../reference/canFam3_exomeplus_BB_EZ_HX1_capture_targets_coord.interval_list \
+TARGET_INTERVALS=../reference/canFam3_exomeplus_BB_EZ_HX1_primary_targets_coord.interval_list 
+
+
+```
+
+&nbsp;
+
+### Loop to run hsMetrics
+And combine results
+```{bash, eval=FALSE, message=FALSE}
+# run one sample
+for FILE in CAT-16C09_paired.collapsed.keep.rmdup.bam; do echo $FILE; sbatch ~/scripts/Ulit/hsMetrics.sbatch $FILE; done
+
+# run all
+for FILE in *keep.rmdup.bam; do echo $FILE; sbatch ~/scripts/Ulit/hsMetrics.sbatch $FILE; done #N=88
+
+
+# Combine hsMetrics results from all samples into one file
+touch hsMetrics_all.txt
+
+for FILE in *.hsMetrics.txt
+do
+ind=$(echo $FILE | awk -F "." '{print $1}'| awk -F "_" '{print $1}')
+res=$(cat $FILE | awk 'FNR == 8 {print}')
+echo $ind $res >> hsMetrics_all.txt
+done
+
+
+touch lowCov.hsMetrics.txt
+for FILE in onTarget/*mrkdup.hsMetrics.txt
+do
+ind=$(echo $FILE | awk -F "." '{print $1}'| awk -F "_" '{print $1}')
+res=$(cat $FILE | awk 'FNR == 8 {print}')
+echo $ind $res >> lowCov.hsMetrics.txt
+done
+
+
+```
+
+&nbsp;
+
+#### Evalutate on target metrics in Rstudio -- part of Table S2
+```{r, warning=FALSE, message=FALSE}
+# Load in metadata
+mydata <- read.table("~/Desktop/Ulit/exome/ExomeSamples_Meta_2-7-2023.csv", header=TRUE, sep=",")
+mydata$Sample_ID <- gsub("_", "-",  mydata$Sample_ID)
+mydata$ISLAND <- factor(mydata$ISLAND, levels=c("SMI", "SRI", "SCZ", "CAT", "SCL", "SNI"))
+
+
+# Load in hsMetrics summary
+tar <- read.delim("~/Desktop/Ulit/exome/hsMetrics_all.txt", header = F)
+tar <- tar %>% separate(V1, into = c("Sample_ID", "BAIT_SET", "BAIT_TERRITORY", "BAIT_DESIGN_EFFICIENCY", "ON_BAIT_BASES",   "NEAR_BAIT_BASES", "OFF_BAIT_BASES", "PCT_SELECTED_BASES", "PCT_OFF_BAIT", "ON_BAIT_VS_SELECTED", "MEAN_BAIT_COVERAGE",      "PCT_USABLE_BASES_ON_BAIT",  "PCT_USABLE_BASES_ON_TARGET", "FOLD_ENRICHMENT", "HS_LIBRARY_SIZE", "HS_PENALTY_10X", "HS_PENALTY_20X", "HS_PENALTY_30X", "HS_PENALTY_40X", "HS_PENALTY_50X", "HS_PENALTY_100X", "TARGET_TERRITORY", "GENOME_SIZE",    "TOTAL_READS", "PF_READS", "PF_BASES", "PF_UNIQUE_READS", "PF_UQ_READS_ALIGNED", "PF_BASES_ALIGNED", "PF_UQ_BASES_ALIGNED",     "ON_TARGET_BASES", "PCT_PF_READS", "PCT_PF_UQ_READS", "PCT_PF_UQ_READS_ALIGNED", "MEAN_TARGET_COVERAGE", "MEDIAN_TARGET_COVERAGE", "MAX_TARGET_COVERAGE", "MIN_TARGET_COVERAGE", "ZERO_CVG_TARGETS_PCT", "PCT_EXC_DUPE", "PCT_EXC_ADAPTER", "PCT_EXC_MAPQ", "PCT_EXC_BASEQ", "PCT_EXC_OVERLAP", "PCT_EXC_OFF_TARGET", "FOLD_80_BASE_PENALTY", "PCT_TARGET_BASES_1X", "PCT_TARGET_BASES_2X", "PCT_TARGET_BASES_10X", "PCT_TARGET_BASES_20X", "PCT_TARGET_BASES_30X",    "PCT_TARGET_BASES_40X", "PCT_TARGET_BASES_50X", "PCT_TARGET_BASES_100X", "AT_DROPOUT", "GC_DROPOUT", "HET_SNP_SENSITIVITY",     "HET_SNP_Q", "SAMPLE", "LIBRARY", "READ_GROUP"), sep = " ")
+
+tar$Sample_ID <- gsub("SCL-40749", "SNI-SCL-40749", tar$Sample_ID)
+
+
+
+tar.df <- left_join(tar, mydata, by="Sample_ID")
+
+tar.df[,3:62] <- lapply(tar.df[,3:62], as.numeric)
+
+
+# summary
+tar.df %>% group_by(Time) %>% summarise(n=n(), 
+                                                PCT_TAR_mean=mean(PCT_USABLE_BASES_ON_TARGET),
+                                                PCT_TAR_sd=sd(PCT_USABLE_BASES_ON_TARGET),
+                                                BAIT_COV_mean=mean(PCT_USABLE_BASES_ON_BAIT),
+                                                BAIT_COV_sd=sd(PCT_USABLE_BASES_ON_BAIT))
+
+tar.tab <- tar.df %>% group_by(ISLAND, Time) %>% summarise(n=n(), 
+                                                PCT_TAR_mean=mean(PCT_USABLE_BASES_ON_TARGET),
+                                                PCT_TAR_sd=sd(PCT_USABLE_BASES_ON_TARGET),
+                                                BAIT_COV_mean=mean(PCT_USABLE_BASES_ON_BAIT),
+                                                BAIT_COV_sd=sd(PCT_USABLE_BASES_ON_BAIT))
+
+#tar.df %>% filter(Sample_ID %in% c("LANHM-006843", "LANHM-085730", "SBMNH-1074", "SBMNH-2063"))
+
+tar.p <- ggpubr::ggline(tar.df, x = "ISLAND", y = "PCT_USABLE_BASES_ON_TARGET", 
+       add = c("mean_se", "jitter"), 
+       ylab = "PCT_USABLE_BASES_ON_TARGET", xlab = "Island")
+
+tar.p2 <- ggpubr::ggline(tar.df, x = "Time", y = "PCT_USABLE_BASES_ON_TARGET", 
+       add = c("mean_se", "jitter"), 
+       order = c("Historical", "Modern"),
+       ylab = "PCT_USABLE_BASES_ON_TARGET", xlab = "Time")
+
+tar.p2
+
+#kruskal.test(PCT_USABLE_BASES_ON_TARGET ~ ISLAND, data=tar.df) # not signif
+kruskal.test(PCT_USABLE_BASES_ON_TARGET ~ Time, data=tar.df) # yes signif
+
+```
+
+&nbsp;
+&nbsp;
+
+# 12) Call SNPs with Freebayes
+Istall freebayes and vcflib on Xsede
+```{bash, eval=FALSE, message=FALSE}
+cd ~/programs/
+
+ python3 -m pip install meson  #meson is the builder for unknown reasons
+ python3 -m pip install ninja  #also need ninja for unknown reasons
+ 
+ git clone --recursive https://github.com/freebayes/freebayes.git
+
+cd freebayes/
+
+meson build/ --buildtype debug
+
+cd build/
+ninja
+ninja test # 5 errors .... but can still access freebayes....?
+
+freebayes/build/freebayes
+
+
+## vcflib
+### cmake higher version than what's installed on xsede
+pip install pybind11
+module load htslib/1.13
+ wget https://github.com/Kitware/CMake/releases/download/v3.25.1/cmake-3.25.1.tar.gz
+ tar -xvf cmake-3.25.1.tar.gz
+ cd cmake-3.25.1/
+ bash bootstrap
+ gmake
+
+### vcflib (https://github.com/vcflib/vcflib/issues/305; https://github.com/Niema-Docker/freebayes/blob/main/Dockerfile#L8-L28) *** Could NOT get this to install on Xsede :( ***
+git clone --recursive https://github.com/vcflib/vcflib.git
+cd vcflib
+mkdir -p build
+cd build
+
+~/programs/cmake-3.25.1/bin/cmake -DCMAKE_BUILD_TYPE=Debug -DZIG=OFF -DOPENMP=OFF ..
+~/programs/cmake-3.25.1/bin/cmake --build .
+
+```
+
+&nbsp;
+
+Move low mapping samples (<10%) & replicates so they aren't included in VCF
+```{bash, eval=FALSE, message=FALSE}
+# these are the same 4 excluded in the previous analyses
+mv LANHM-006843_paired.collapsed.keep.rmdup.* lowMapSamples/
+mv LANHM-085730_paired.collapsed.keep.rmdup.* lowMapSamples/
+mv SBMNH-1074_paired.collapsed.keep.rmdup.* lowMapSamples/
+mv SBMNH-2063_paired.collapsed.keep.rmdup.* lowMapSamples/
+
+mv CAT-59-1477A-2_paired.collapsed.keep.rmdup.* replicateSamples/
+mv LANHM-007959-2_paired.collapsed.keep.rmdup.* replicateSamples/
+mv SRI-16123-2_paired.collapsed.keep.rmdup.* replicateSamples/
+```
+This leaves N=88 for SNP calling
+
+&nbsp;
+
+Split chromosomes/scaffolds into separate files
+Because I can only run 1000 jobs at a time
+```{bash, eval=FALSE, message=FALSE}
+# get list of chr/scaffolds
+awk '{print $1}' ../reference/canFam3.chrom.sizes > ../reference/canFam3.chrNames
+
+# split into 4 groups bc I can only run 1000 jobs at a time
+# 3268/4 = 817
+awk 'NR >= 1 && NR <= 817' ../reference/canFam3.chrNames > ../reference/canFam3.chrNames_1-817
+awk 'NR >= 818 && NR <= 1635' ../reference/canFam3.chrNames > ../reference/canFam3.chrNames_818-1635
+awk 'NR >= 1636 && NR <= 2453' ../reference/canFam3.chrNames > ../reference/canFam3.chrNames_1636-2453
+awk 'NR >= 2454 && NR <= 3271' ../reference/canFam3.chrNames > ../reference/canFam3.chrNames_2453-3271
+
+```
+
+&nbsp;
+
+## Call SNPs using Freebayes
+Batch script to call SNPs per chromosome/scaffold using Freebayes (~/scripts/Ulit/snpCall.sbatch)
+```{bash, eval=FALSE, message=FALSE}
+#!/bin/bash
+#SBATCH --job-name=snpCall
+#SBATCH --output=snpCall.%j.out
+#SBATCH --error=snpCall.%j.err
+#SBATCH -t 96:00:00
+#SBATCH -p EM
+#SBATCH -N 1
+#SBATCH --ntasks-per-node 24
+##SBATCH --mem=4G
+#SBATCH -A xxx
+#SBATCH --mail-type=END
+
+
+CHR=$1
+
+REF="/ocean/projects/mcb200015p/adamsne2/UlitExome/reference/canFam3.fa"
+
+
+#mkdir /ocean/projects/mcb200015p/adamsne2/UlitExome/bwaAln_vcfs
+#cd /ocean/projects/mcb200015p/adamsne2/UlitExome/bwaMap
+
+## Call SNPs by chr/scaffold
+~/programs/freebayes/build/freebayes -f $REF -r $CHR *.rmdup.bam > ../bwaAln_vcfs/ulit_bwaAln\.$CHR.vcf
+
+
+## Call invariant sites by chr/scaffold (for pixy)
+~/programs/freebayes/build/freebayes --report-monomorphic -f $REF -r $CHR *.rmdup.bam > ../bwaAln_vcfs/ulit_bwaAln\.$CHR.invar.vcf
+
+
+bgzip ../bwaAln_vcfs/ulit_bwaAln\.$CHR.invar.vcf > ../bwaAln_vcfs/ulit_bwaAln\.$CHR.invar.vcf.gz 
+
+
+```
+
+&nbsp;
+
+### Loop to run Freebayes over chromosomes/scaffolds
+```{bash, eval=FALSE, message=FALSE}
+# chr 1-817 (run with RM)
+head -1 ../reference/canFam3.chrNames_1-817 | while read CHR; do echo $CHR; sbatch ~/scripts/Ulit/snpCall.sbatch $CHR; done
+
+cat ../reference/canFam3.chrNames_1-817 | while read CHR; do echo $CHR; sbatch ~/scripts/Ulit/snpCall.sbatch $CHR; done
+
+# chr 818-1635 (ran the next 3 w RM-shared)
+# test one
+head -1 ../reference/canFam3.chrNames_818-1635 | while read CHR; do echo $CHR; sbatch ~/scripts/Ulit/snpCall.sbatch $CHR; done
+
+# full
+cat ../reference/canFam3.chrNames_818-1635 | while read CHR; do echo $CHR; sbatch ~/scripts/Ulit/snpCall.sbatch $CHR; done
+
+# chr 1636-2453
+cat ../reference/canFam3.chrNames_1636-2453 | while read CHR; do echo $CHR; sbatch ~/scripts/Ulit/snpCall.sbatch $CHR; done
+
+# chr 2453-3271
+cat ../reference/canFam3.chrNames_2453-3271 | while read CHR; do echo $CHR; sbatch ~/scripts/Ulit/snpCall.sbatch $CHR; done
+
+
+### ~/scripts/ulit/zipVCFs.sbatch
+module load htslib/1.13
+for FILE in ulit_bwaAln.chr1.vcf; do echo $FILE; bgzip -c $FILE > $FILE.gz ; done
+```
+
+&nbsp;
+
+### Combine chromosome/scaffold VCFs
+Batch script to ombine chromosome/scaffold VCF outputs from Freebayes (~/scripts/Ulit/mergeVCFs.sbatch)
+```{bash, eval=FALSE, message=FALSE}
+#!/bin/bash
+#SBATCH --job-name=merge
+#SBATCH --output=merge.%j.out
+#SBATCH --error=merge.%j.err
+#SBATCH -t 48:00:00
+#SBATCH -p RM
+#SBATCH -N 1
+#SBATCH --ntasks-per-node 16
+##SBATCH --mem=4G
+#SBATCH -A xxx
+#SBATCH --mail-type=END
+
+
+# make a file of vcf files to merge
+#ls ulit_bwaAln.chr*.vcf | sort > chr_vcfs.list
+
+#grep '^#' ulit_bwaAln.chr1.vcf > ulit_bwaAln.merged.vcf
+#grep -v '^#'  ulit_bwaAln*.vcf  >> ulit_bwaAln.merged.vcf
+
+module load bcftools/1.10.2
+bcftools concat --file-list chr_vcfs.list -O z -o ulit_bwaAln.merged.vcf.gz --threads 16
+
+
+
+# combine invariant VCF files for pixy
+#ls *invar.vcf | sort > chr_vcfs_invar.list
+bcftools concat --file-list chr_vcfs_invar.list -O z -o ulit_bwaAln.merged.invar.vcf.gz --threads 24
+
+```
+
+&nbsp;
+
+Get number of individuals and sites in merged VCF file
+```{bash, eval=FALSE, message=FALSE}
+tabix -p vcf ulit_bwaAln.merged.vcf.gz
+# number of sites
+zcat ulit_bwaAln.merged.vcf.gz | egrep -v "^#" | wc -l # 27,003,261
+
+# number of indiv
+bcftools query -l ulit_bwaAln.merged.vcf.gz | wc -l # 88
+```
+
+&nbsp;
+&nbsp;
+
+### Calculate depth in merged VCF file
+```{bash, eval=FALSE, message=FALSE}
+module load vcftools/0.1.16
+
+vcftools --gzvcf ../bwaAln_vcfs/ulit_bwaAln.merged.vcf.gz --depth --out ulit_bwaAln.merged.dp
+
+```
+
+&nbsp;
+
+#### Evaluate depth results in Rstudio -- Part of Table S2
+```{r, warning=FALSE, message=FALSE}
+# Load in metadata
+mydata <- read.table("~/Desktop/Ulit/exome/ExomeSamples_Meta_2-7-2023.csv", header=TRUE, sep=",")
+mydata$Sample_ID <- gsub("_", "-",  mydata$Sample_ID)
+mydata$ISLAND <- factor(mydata$ISLAND, levels=c("SMI", "SRI", "SCZ", "CAT", "SCL", "SNI"))
+
+# Load in depth results
+dp <- read.delim("~/Desktop/Ulit/exome/ulit_bwaAln.merged.dp.idepth")
+dp$Sample_ID <- dp$INDV
+dp$Sample_ID <- gsub("SCL-40749", "SNI-SCL-40749", dp$Sample_ID)
+
+dp.df <- left_join(dp, mydata)
+
+# get summary
+dp.tab <- dp.df %>% group_by(ISLAND, Time) %>% summarise(n=n(), mean(MEAN_DEPTH), sd(MEAN_DEPTH))
+dp.df %>% group_by(Time) %>% summarise(n=n(), mean(MEAN_DEPTH), sd(MEAN_DEPTH))
+
+
+dp.p <- ggpubr::ggline(dp.df, x = "ISLAND", y = "MEAN_DEPTH", 
+       add = c("mean_se", "jitter"), 
+       ylab = "MEAN_DEPTH", xlab = "Island")
+
+dp.p2 <- ggpubr::ggline(dp.df, x = "Time", y = "MEAN_DEPTH", 
+       add = c("mean_se", "jitter"), 
+       order = c("Historical", "Modern"),
+       ylab = "MEAN_DEPTH", xlab = "Time")
+
+dp.p
+
+kruskal.test(MEAN_DEPTH ~ ISLAND, data=dp.df) # signif
+kruskal.test(MEAN_DEPTH ~ Time, data=dp.df) # not signif
+
+```
+
+&nbsp;
+&nbsp;
+
+# 13) Basic filter VCF
+Batch script to filter SNPs and individuals (~/scripts/ulit/filterVCFs.sbatch)
+```{bash, eval=FALSE, message=FALSE}
+#!/bin/bash
+#SBATCH --job-name=filtVCF
+#SBATCH --output=filtVCF.%j.out
+#SBATCH --error=filtVCF.%j.err
+#SBATCH -t 48:00:00
+#SBATCH -p RM
+#SBATCH -N 1
+#SBATCH --ntasks-per-node 16
+##SBATCH --mem=4G
+#SBATCH -A xxx
+#SBATCH --mail-type=END
+
+module load vcftools/0.1.16 htslib/1.13
+
+# 1) genotype level filtering: keep base quality 20, keep only biallelic alleles, originally had minDP 3 but reviewer suggested minDP 5 if found any damage
+vcftools --gzvcf ulit_bwaAln.merged.vcf.gz --minGQ 20 --minDP 5 --min-alleles 2 --max-alleles 2 --max-missing 0.01 --recode --recode-INFO-all --out ulit_bwaAln.merged_1filter
+
+module load htslib/1.13
+bgzip -c ulit_bwaAln.merged_1filter.recode.vcf > ulit_bwaAln.merged_1filter.recode.vcf.gz
+
+## kept 88 out of 88 Individuals, kept 6073646 out of a possible 27003261 Sites
+
+# 2) look at missingness by indiv
+vcftools --gzvcf ulit_bwaAln.merged_1filter.recode.vcf.gz --missing-indv --out ulit_bwaAln.merged_1filter.recode
+
+
+######## for pixy #######
+# 1) initial filter
+vcftools --gzvcf ulit_bwaAln.merged.invar.vcf.gz  --remove-indels --max-missing 0.75  --min-DP 5  --max-meanDP 500 --recode --stdout | gzip -c > ulit_bwaAln.merged.invar_filtered.vcf.gz 
+
+# 2) create a filtered VCF containing only invariant sites  
+vcftools --gzvcf ulit_bwaAln.merged.invar_filtered.vcf.gz  --max-maf 0 --recode --stdout | bgzip -c > ulit_bwaAln.merged.invarOnly_filtered.vcf.gz
+
+# 3) create a filtered VCF containing only variant sites
+vcftools --gzvcf ulit_bwaAln.merged.invar_filtered.vcf.gz --mac 1 --recode --stdout | bgzip -c > ulit_bwaAln.merged.invarVar_filtered.vcf.gz
+
+# 4) filter var sites on indiv missingness
+vcftools --gzvcf ulit_bwaAln.merged.invarVar_filtered.vcf.gz --missing-indv --out ulit_bwaAln.merged.invarVar_filtered 
+
+```
+
+&nbsp;
+
+## Evaluate missing data in Rstudio
+```{r, warning=FALSE, message=FALSE}
+# Load in metadata
+mydata <- read.table("/Users/neasci/Desktop/Ulit/exome/ExomeSamples_forMap_4-26-2018.csv", header=TRUE, sep=",")
+mydata$ISLAND <- factor(mydata$ISLAND, levels=c("SMI", "SRI", "SCZ", "CAT", "SCL", "SNI"))
+mydata$Sample_ID <- gsub("_", "-", mydata$Sample_ID) 
+
+# Load in missing data
+miss.df <- read.table("/Users/neasci/Desktop/Ulit/exome/ulit_bwaAln.merged_1filter.recode.imiss", header = T)
+miss.df <- miss.df %>% rename("Sample_ID"="INDV")
+miss.df$Sample_ID <- gsub("SCL-40749", "SNI-SCL-40749", miss.df$Sample_ID)
+
+miss.p <- hist(miss.df$F_MISS)
+
+miss.p
+
+miss.meta.df <- left_join(miss.df, mydata, by="Sample_ID")
+
+miss.p2 <- ggplot(miss.meta.df, aes(x=ISLAND, y=F_MISS, color=Time)) +
+  geom_boxplot() +
+ # scale_color_grey(start=0.25, end=0.65) +
+  theme_minimal()
+
+miss.p2
+
+# find the samples with high rates of missing data
+# miss.meta.df %>% filter(F_MISS > 0.5) %>% arrange(-F_MISS)
+
+# 10 samples with > 50% missing: 4 samples > 80% missing; 4 with > 60% missing
+
+# with all 88 samples here's the N breakdown by isalnd and time
+# miss.meta.df %>% group_by(ISLAND, Time) %>% count()
+
+# with >75% missing here's the N breakdown
+# miss.meta.df %>% filter(F_MISS < 0.75) %>% group_by(ISLAND, Time) %>% count()
+
+# seems like ~okay~ to loose these based on sample sizes.
+
+```
+
+&nbsp;
+
+## Continue with VCF filtering
+Batch script to continue filtering SNPs and individuals (~/scripts/ulit/filterVCFs.sbatch)
+```{bash, eval=FALSE, message=FALSE}
+#!/bin/bash
+#SBATCH --job-name=filtVCF
+#SBATCH --output=filtVCF.%j.out
+#SBATCH --error=filtVCF.%j.err
+#SBATCH -t 4:00:00
+#SBATCH -p RM-shared
+#SBATCH -N 1
+#SBATCH --ntasks-per-node 16
+##SBATCH --mem=4G
+#SBATCH -A xxx
+#SBATCH --mail-type=END
+
+
+module load vcftools/0.1.16
+
+# 1) genotype level filtering: keep base quality 20, keep only biallelic alleles, originally had minDP 3 but reviewer suggested minDP 5 if found any damage
+vcftools --gzvcf ulit_bwaAln.merged.vcf.gz --minGQ 20 --minDP 5 --min-alleles 2 --max-alleles 2 --max-missing 0.01 --recode --recode-INFO-all --out ulit_bwaAln.merged_1filter
+
+module load htslib/1.13
+bgzip -c ulit_bwaAln.merged_1filter.recode.vcf > ulit_bwaAln.merged_1filter.recode.vcf.gz
+
+## kept 88 out of 88 Individuals, kept 6073646 out of a possible 27003261 Sites
+
+# 2) look at missingness by indiv: rm individuals with >75% missing data AND genotypes with 75% missing data
+vcftools --gzvcf ulit_bwaAln.merged_1filter.recode.vcf.gz --missing-indv --out ulit_bwaAln.merged_1filter.recode
+
+cat ulit_bwaAln.merged_1filter.recode.imiss | awk '$5 < 0.75' | awk '{print $1}' > ulit_bwaAln.merged_1filter.recode.miss75.list 
+
+vcftools --gzvcf ulit_bwaAln.merged_1filter.recode.vcf.gz --max-missing 0.75 --keep ulit_bwaAln.merged_1filter.recode.miss75.list --recode --recode-INFO-all --out ulit_bwaAln.merged_1filter.miss75.imiss75
+
+bgzip -c ulit_bwaAln.merged_1filter.miss75.imiss.75.recode.vcf > ulit_bwaAln.merged_1filter.miss75.imiss75.recode.vcf.gz
+
+## kept 83 out of 88 Individuals, kept 3721301 out of a possible 6073646 Sites
+
+# 3) filter maf= 0.01 (only for MDS, tree, Fst)
+vcftools --gzvcf ulit_bwaAln.merged_1filter.miss75.imiss75.recode.vcf.gz --maf 0.01 --recode --recode-INFO-all --out ulit_bwaAln.merged_1filter.miss75.imiss75.maf01
+
+bgzip -c ulit_bwaAln.merged_1filter.miss75.imiss75.maf01.recode.vcf > ulit_bwaAln.merged_1filter.miss75.imiss75.maf01.recode.vcf.gz
+
+## kept 83 out of 88 Individuals, kept 395627 out of a possible 3721301 Sites
+
+
+####### for pixy #####
+# 4) filter var sites on indiv missingness
+cat ulit_bwaAln.merged.invarVar_filtered.imiss | awk '$5 < 0.75' | awk '{print $1}' > ulit_bwaAln.merged.invarVar_filtered.miss75.list  
+
+vcftools --gzvcf ulit_bwaAln.merged.invarVar_filtered.vcf.gz --keep ulit_bwaAln.merged.invarVar_filtered.miss75.list ---recode --stdout | bgzip -c > ulit_bwaAln.merged.invarVar_filtered.miss75.vcf.gz
+
+
+```
+
+&nbsp;
+&nbsp;
+
+# 14) Filter VCF for excess heterozygosity
+
+## Step 0:
+need to assign snp IDs in VCF: (https://evomics.org/wp-content/uploads/2022/06/Population-Genomics-Lab-1.pdf)
+(~/scripts/Ulit/assignSNPids.sbatch)
+for MDS, tree, Fst (with maf)
+```{bash, eval=FALSE, message=FALSE}
+#!/bin/bash
+#SBATCH --job-name=snpIDs
+#SBATCH --output=snpIDs.%j.out
+#SBATCH --error=snpIDs.%j.err
+#SBATCH -t 4:00:00
+#SBATCH -p RM-shared
+#SBATCH -N 1
+##SBATCH --ntasks-per-node 16
+##SBATCH --mem=4G
+#SBATCH -A xxx
+#SBATCH --mail-type=END
+
+
+#zgrep -v "^#"  ulit_bwaAln.merged_1filter.miss75.imiss75.maf01.recode.vcf.gz | head -n 3
+
+ module load bcftools/1.10.2
+
+bcftools annotate -Oz --set-id +'%CHROM\_%POS' ulit_bwaAln.merged_1filter.miss75.imiss75.maf01.recode.vcf.gz \
+-o ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs.vcf.gz
+
+zgrep -v "^#" ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs.vcf.gz | head | cut -f 1-3
+
+```
+
+&nbsp;
+
+### Repeat for het, pi, TD (w/o maf)
+```{bash, eval=FALSE, message=FALSE}
+
+module load bcftools/1.10.2
+
+bcftools annotate -Oz --set-id +'%CHROM\_%POS' ulit_bwaAln.merged_1filter.miss75.imiss75.recode.vcf.gz \
+-o ulit_bwaAln.merged_1filter.miss75.imiss75_IDs.vcf.gz
+
+zgrep -v "^#" ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs.vcf.gz | head | cut -f 1-3
+
+#3721301 Sites
+
+
+### for pixy ###
+bcftools annotate -Oz --set-id +'%CHROM\_%POS' ulit_bwaAln.merged.invarVar_filtered.miss75.vcf.gz \
+-o ulit_bwaAln.merged.invarVar_filtered.miss75_IDs.vcf.gz 
+
+
+```
+
+&nbsp;
+
+## Step 1:
+```{bash, eval=FALSE, message=FALSE}
+# for MDS, tree, Fst (with maf)
+
+#Take vcf and Remove SNPs with observed heterozygosity > 0.6 * 
+module load vcftools/0.1.16
+#1) calc hwe 
+vcftools --gzvcf ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs.vcf.gz --hardy --out ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs.h 
+#2) 
+cat ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs.h.hwe | grep -v CHR | awk -F"/" '{print $1" "$2" "$3}' | awk '{print $1" "$2" "$3" "$4" "$5}' | awk '{print $1" "$2" "$3" "$4" "$5" "$4/($3+$4+$5)}' > ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_ohz.txt 
+#3)
+cat ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs.h.hwe | grep -v CHR | awk '{print $1 " "$2" "$5 " "$6 " "$7}' > ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hwepval 
+# 4)
+zgrep -v "^##" ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs.vcf.gz | cut -f1-3 > ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_snpIDs 
+
+```
+
+&nbsp;
+
+### Repeat for het, pi, TD (w/o maf)
+```{bash, eval=FALSE, message=FALSE}
+#Take vcf and Remove SNPs with observed heterozygosity > 0.6 * 
+module load vcftools/0.1.16
+#1) calc hwe 
+vcftools --gzvcf ulit_bwaAln.merged_1filter.miss75.imiss75_IDs.vcf.gz --hardy --out ulit_bwaAln.merged_1filter.miss75.imiss75_IDs.h 
+#2) 
+cat ulit_bwaAln.merged_1filter.miss75.imiss75_IDs.h.hwe | grep -v CHR | awk -F"/" '{print $1" "$2" "$3}' | awk '{print $1" "$2" "$3" "$4" "$5}' | awk '{print $1" "$2" "$3" "$4" "$5" "$4/($3+$4+$5)}' > ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_ohz.txt 
+#3)
+cat ulit_bwaAln.merged_1filter.miss75.imiss75_IDs.h.hwe | grep -v CHR | awk '{print $1 " "$2" "$5 " "$6 " "$7}' > ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_hwepval 
+# 4)
+zgrep -v "^##" ulit_bwaAln.merged_1filter.miss75.imiss75_IDs.vcf.gz | cut -f1-3 > ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_snpIDs 
+
+
+##### for pixy #####
+#1) calc hwe 
+vcftools --gzvcf ulit_bwaAln.merged.invarVar_filtered.miss75_IDs.vcf.gz --hardy --out ulit_bwaAln.merged.invarVar_filtered.miss75_IDs.h 
+#2) 
+cat ulit_bwaAln.merged.invarVar_filtered.miss75_IDs.h.hwe | grep -v CHR | awk -F"/" '{print $1" "$2" "$3}' | awk '{print $1" "$2" "$3" "$4" "$5}' | awk '{print $1" "$2" "$3" "$4" "$5" "$4/($3+$4+$5)}' > ulit_bwaAln.merged.invarVar_filtered.miss75_IDs_ohz.txt 
+#3)
+cat ulit_bwaAln.merged.invarVar_filtered.miss75_IDs.h.hwe | grep -v CHR | awk '{print $1 " "$2" "$5 " "$6 " "$7}' > ulit_bwaAln.merged.invarVar_filtered.miss75_IDs_hwepval 
+# 4)
+zgrep -v "^##" ulit_bwaAln.merged.invarVar_filtered.miss75_IDs.vcf.gz | cut -f1-3 > ulit_bwaAln.merged.invarVar_filtered.miss75_IDs_snpIDs 
+```
+
+&nbsp;
+
+## Step 2: 
+```{r, warning=FALSE, message=FALSE}
+# for MDS, tree, Fst (with maf)
+
+dat <- read.table("~/Desktop/Ulit/exome/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hwepval", header=FALSE)
+dat.ohz <- read.table("~/Desktop/Ulit/exome/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_ohz.txt", header=FALSE)
+
+dat.SNPids <- read.delim("~/Desktop/Ulit/exome/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_snpIDs", header=TRUE)
+names(dat.SNPids) <- c("CHROM", "POS", "SNPid")
+dat.ohz <- cbind(dat.ohz, dat.SNPids$SNPid)
+
+#hist(dat$V5)
+#hist(dat$V4)
+
+#hist(dat.ohz$V6)
+
+names(dat.ohz) <- c("CHR", "POS", "AA", "AB", "BB", "Ho", "SNPid")
+
+filtered.ohz <- subset(dat.ohz, AB >= 1 & Ho <= 0.6)
+
+bed_filtered.ohz <- data.frame(CHR = filtered.ohz$CHR, START = filtered.ohz$POS-1, END = filtered.ohz$POS)
+
+snpIDs.filtered.ohz <- data.frame(snp = filtered.ohz$SNPid)
+
+#write.table(snpIDs.filtered.ohz, "~/Desktop/Ulit/exome/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_snpIDs.filtered.ohz", sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+
+#write.table(bed_filtered.ohz, "~/Desktop/Ulit/exome/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_bed_filtered.ohz", sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+
+```
+
+&nbsp;
+
+### Repeat for het, pi, TD (w/o maf)
+```{r, warning=FALSE, message=FALSE, eval=FALSE}
+dat2 <- read.table("~/Desktop/Ulit/exome/ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_hwepval", header=FALSE)
+dat.ohz2 <- read.table("~/Desktop/Ulit/exome/ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_ohz.txt", header=FALSE)
+
+dat.SNPids2 <- read.delim("~/Desktop/Ulit/exome/ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_snpIDs", header=TRUE)
+names(dat.SNPids2) <- c("CHROM", "POS", "SNPid")
+dat.ohz.df <- cbind(dat.ohz2, dat.SNPids2$ID)
+
+#hist(dat2$V5)
+#hist(dat2$V4)
+
+#hist(dat.ohz2$V6)
+
+names(dat.ohz.df) <- c("CHR", "POS", "AA", "AB", "BB", "Ho", "SNPid")
+
+filtered.ohz2 <- subset(dat.ohz.df, AB >= 1 & Ho <= 0.6)
+
+bed_filtered.ohz2 <- data.frame(CHR = filtered.ohz2$CHR, START = filtered.ohz2$POS-1, END = filtered.ohz2$POS)
+
+snpIDs.filtered.ohz2 <- data.frame(snp = filtered.ohz2$SNPid)
+
+#write.table(snpIDs.filtered.ohz2, "~/Desktop/Ulit/exome/ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_snpIDs.filtered.ohz", sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+
+#write.table(bed_filtered.ohz2, "~/Desktop/Ulit/exome/ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_bed_filtered.ohz", sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+
+
+####### for pixy #######
+dat2 <- read.table("~/Desktop/Ulit/exome/forPixy/ulit_bwaAln.merged.invarVar_filtered.miss75_IDs_hwepval", header=FALSE)
+dat.ohz2 <- read.table("~/Desktop/Ulit/exome/forPixy/ulit_bwaAln.merged.invarVar_filtered.miss75_IDs_ohz.txt", header=FALSE)
+
+dat.SNPids2 <- read.delim("~/Desktop/Ulit/exome/forPixy/ulit_bwaAln.merged.invarVar_filtered.miss75_IDs_snpIDs", header=TRUE)
+names(dat.SNPids2) <- c("CHROM", "POS", "SNPid")
+names(dat.ohz2) <- c("CHROM", "POS","AA", "AB", "BB", "Ho")
+#dat.ohz.df <- cbind(dat.ohz2, dat.SNPids2$ID)
+dat.ohz.df <- left_join(dat.ohz2, dat.SNPids2)
+
+hist(dat2$V5)
+hist(dat2$V4)
+
+#hist(dat.ohz2$V6)
+hist(dat.ohz2$Ho)
+
+#names(dat.ohz.df) <- c("CHR", "POS", "AA", "AB", "BB", "Ho", "SNPid")
+
+filtered.ohz2 <- subset(dat.ohz.df, AB >= 1 & Ho <= 0.6)
+
+bed_filtered.ohz2 <- data.frame(CHR = filtered.ohz2$CHR, START = filtered.ohz2$POS-1, END = filtered.ohz2$POS)
+
+snpIDs.filtered.ohz2 <- data.frame(snp = filtered.ohz2$SNPid)
+
+#write.table(snpIDs.filtered.ohz2, "~/Desktop/Ulit/exome/forPixy/ulit_bwaAln.merged.invarVar_filtered.miss75_IDs_snpIDs.filtered.ohz", sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+
+#write.table(bed_filtered.ohz2, "~/Desktop/Ulit/exome/forPixy/ulit_bwaAln.merged.invarVar_filtered.miss75_IDs_bed_filtered.ohz", sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+
+```
+
+&nbsp;
+
+## Step 3:
+```{bash, eval=FALSE, message=FALSE, eval=FALSE}
+# for MDS, tree, Fst (with maf)
+
+# ~/scripts/Ulit/filterVCFs.sbatch
+vcftools --gzvcf ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs.vcf.gz --snps ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_snpIDs.filtered.ohz --recode --recode-INFO-all --out ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz
+
+bgzip -c ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz.recode.vcf > ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz.recode.vcf.gz
+
+## kept 83 out of 83 Individuals, kept 351661 out of a possible 395627 Sites
+
+```
+
+&nbsp;
+
+### Repeat for het, pi, TD (w/o maf)
+```{bash, eval=FALSE, message=FALSE, eval=FALSE}
+# ~/scripts/Ulit/filterVCFs.sbatch
+vcftools --gzvcf ulit_bwaAln.merged_1filter.miss75.imiss75_IDs.vcf.gz --snps ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_snpIDs.filtered.ohz --recode --recode-INFO-all --out ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_hz
+
+bgzip -c ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_hz.recode.vcf > ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_hz.recode.vcf.gz
+
+## kept 83 out of 83 Individuals,  kept 879239 out of a possible 3721301 Sites
+
+
+###### pixy #####
+vcftools --gzvcf ulit_bwaAln.merged.invarVar_filtered.miss75_IDs.vcf.gz --snps ulit_bwaAln.merged.invarVar_filtered.miss75_IDs_snpIDs.filtered.ohz --recode --recode-INFO-all --out ulit_bwaAln.merged.invarVar_filtered.miss75_IDs_hz
+
+```
+
+&nbsp;
+
+# 15) Prune for LD
+## Batch script to get sites in LD using Plink (~/scripts/Ulit/pruneLD.sbatch)
+```{bash, eval=FALSE, message=FALSE}
+#!/bin/bash
+#SBATCH --job-name=LD
+#SBATCH --output=LD.%j.out
+#SBATCH --error=LD.%j.err
+#SBATCH -t 4:00:00
+#SBATCH -p RM-shared
+#SBATCH -N 1
+##SBATCH --ntasks-per-node 16
+##SBATCH --mem=4G
+#SBATCH -A xxx
+#SBATCH --mail-type=END
+
+
+~/programs/plink --vcf ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz.recode.vcf.gz --out ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_pruned --indep-pairwise 50 5 0.2 --allow-extra-chr --chr-set 38 --double-id
+
+```
+
+&nbsp;
+
+### Repeat for het, pi, TD (w/o maf)
+```{bash, eval=FALSE, message=FALSE}
+
+~/programs/plink --vcf ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_hz.recode.vcf --out ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_hz_pruned --indep-pairwise 50 5 0.2 --allow-extra-chr --chr-set 38 --double-id
+
+
+#### for pixy ###
+~/programs/plink --vcf ulit_bwaAln.merged.invarVar_filtered.miss75_IDs_hz.recode.vcf --out ulit_bwaAln.merged.invarVar_filtered.miss75_IDs_hz_pruned --indep-pairwise 50 5 0.2 --allow-extra-chr --chr-set 38 --double-id
+
+```
+
+&nbsp;
+
+## Batch script to filter LD sites using VCFtools (~/scripts/Ulit/pruneLD.sbatch)
+```{bash, eval=FALSE, message=FALSE}
+# for MDS, tree, Fst (with maf)
+
+# filter vcf for sites not in LD using plink output
+
+vcftools --gzvcf ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz.recode.vcf.gz --snps ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_pruned.prune.in --recode --recode-INFO-all --out ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD
+
+# 83 out of 83 indiv,  kept 104173 out of a possible 351661 Sites
+
+bgzip -c ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.recode.vcf > ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.recode.vcf.gz
+```
+
+&nbsp;
+
+### Repeat for het, pi, TD (w/o maf)
+```{bash, eval=FALSE, message=FALSE}
+# filter vcf for sites not in LD using plink output
+
+vcftools --gzvcf ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_hz.recode.vcf.gz --snps ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_hz_pruned.prune.in --recode --recode-INFO-all --out ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_hz_noLD
+
+# 83 out of 83 indiv,  kept 318406 out of a possible 879239 Sites
+
+bgzip -c ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_hz_noLD.recode.vcf > ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_hz_noLD.recode.vcf.gz
+
+
+###### for pixy ####
+vcftools --vcf ulit_bwaAln.merged.invarVar_filtered.miss75_IDs_hz.recode.vcf --snps ulit_bwaAln.merged.invarVar_filtered.miss75_IDs_hz_pruned.prune.in --recode --recode-INFO-all --out ulit_bwaAln.merged.invarVar_filtered.miss75_IDs_hz_noLD
+```
+
+&nbsp;
+&nbsp;
+&nbsp;
+&nbsp;
+
+# 16) Population differentiation
+## Multidimensional scaling (MDS) using Plink
+```{bash, eval=FALSE, message=FALSE}
+~/programs/plink --bfile ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD --chr-set 38 --double-id --allow-extra-chr --mds-plot 6 eigvals --cluster --out ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.mds 
+
+```
+
+&nbsp;
+
+### Plot MDS in R -- Figure 2 C
+```{r, warning=FALSE, message=FALSE}
+# Define colors
+cols <- c("SMI" = "midnightblue", "SRI" = "royalblue2", "SCZ" = "cadetblue2", "CAT" = "darkred", "SCL" = "firebrick1", "SNI" = "darksalmon")
+
+mds <- read_table("~/Desktop/Ulit/exome/MDS/bwaAln_mds/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.mds.mds", col_names = T)
+eigenval.m <- scan("~/Desktop/Ulit/exome/MDS/bwaAln_mds/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.mds.mds.eigvals")
+
+mds <- mds[,-1]
+# set names
+names(mds)[1] <- "Sample_ID"
+mds$Sample_ID <- gsub("SCL-40749", "SNI-SCL-40749", mds$Sample_ID)
+
+mds.meta <- left_join(mds, mydata, by="Sample_ID")
+
+
+# first convert to percentage variance explained
+pve.m <- data.frame(Co = 1:6, pve = eigenval.m/sum(eigenval.m)*100)
+
+a.m <- ggplot(pve.m, aes(Co, pve)) + geom_bar(stat = "identity")+
+  ylab("Percentage variance explained") + theme_light()
+
+# calculate the cumulative sum of the percentage variance explained
+# cumsum(pve.m$pve)
+
+mds.x <- ggplot(mds.meta, aes(x=C1, y=C2)) +
+  geom_point(aes(fill=ISLAND, shape=Time), size=4, alpha=0.8) + #changed pont size from 8 to 4
+  scale_fill_manual(values = cols, labels=c("SMI" = "SMI*", "SRI" = "SRI*", "SCZ" = "SCZ*", "CAT" = "CAT*", "SCL" = "SCL", "SNI" = "SNI")) + 
+  scale_shape_manual(values=c(21, 24)) +
+  guides(fill = guide_legend(override.aes=list(shape=21)))+
+  #labs(x= paste0("C1 (", signif(pve.m$pve[1], 3), "%)"), y=paste0("C2 (", signif(pve.m$pve[2], 3), "%)"), fill="Island", shape="Time") +
+  labs(x= paste0("C1"), y=paste0("C2"), fill="Island", shape="Time") +
+  theme_minimal() +
+  theme(text = element_text(size=18), axis.text.x = element_text(size = 22), axis.text.y = element_text(size = 18))
+
+mds.x
+
+```
+
+&nbsp;
+&nbsp;
+
+## Maximum likelihood tree
+```{bash, eval=FALSE, message=FALSE}
+# make vcf file with numeric chrs 
+awk '{gsub(/^chr/,""); print}' your.vcf > no_chr.vcf 
+
+zcat ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.recode.vcf.gz | awk '{gsub(/^chr/,""); print}' > ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.NumChr.vcf 
+
+# run snphylo on MSU cluster bc Xsede doesn't have it and it's no longer being maintained so I can't download it.....(!)
+
+scp adamsne2@bridges2.psc.xsede.org:"/ocean/projects/mcb200015p/adamsne2/UlitExome/bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.NumChr.vcf" .
+
+scp ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.NumChr.vcf adamsn23@gateway.hpcc.msu.edu:"/mnt/home/adamsn23/Ulit"
+
+```
+
+&nbsp;
+
+```{bash, eval=FALSE, message=FALSE}
+module load GNU/6.4.0-2.28  OpenMPI/2.1.2 bcftools/1.9.64
+bcftools query -l ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.NumChr.vcf > shortNames_bwaAln.txt
+
+# manually edited shortNames file so that SBMNH was SB and LAMNH is LA and CAT-##-### is just CAT-##
+
+bcftools reheader --samples shortNames_bwaAln.txt ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.NumChr.vcf -o ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.NumChr.shrtNam.vcf  
+
+```
+
+&nbsp;
+
+```{bash, eval=FALSE, message=FALSE}
+#!/bin/sh 
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH -t 1:00:00
+#SBATCH --cpus-per-task=1
+#SBATCH --mem-per-cpu=2G
+#SBATCH -J snphylo
+#SBATCH -o snphylo.%j.out
+#SBATCH --error snphylo.%j.err
+
+module load GCC/9.3.0  OpenMPI/4.0.3 SNPhylo/20160204-Python-3.8.2-R-4.0.3
+
+snphylo.sh -v ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.NumChr.shrtNam.vcf -A -b -r -a 38 
+
+
+
+#Running output
+#start writing: 83 samples, 82685 SNPs
+#Excluding 4,266 SNPs on non-autosomes
+#Excluding 67,642 SNPs (monomorphic: TRUE, MAF: 0.1, missing rate: 0.1)
+    # of samples: 83
+    # of SNPs: 10,777
+#    using 1 thread
+#    sliding window: 500,000 basepairs, Inf SNPs
+
+#4,287 markers are selected in total.
+```
+
+&nbsp;
+
+For R code to make tree see Ulit_tree4ms_2-1-22.R
+
+&nbsp;
+&nbsp;
+
+## Calculate identity-by-descent (IBD) in Plink
+```{r, eval=FALSE, warning=FALSE, message=FALSE}
+#fix .fam file with island as FID, instead of indiv as both FID and IID
+
+meta <- read.table("~/Desktop/Ulit/exome/Het/Sample_metadata_nolow.txt", header=TRUE)
+
+fam <- read.table("~/Desktop/Ulit/exome/ibd/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.fam_og")
+
+fam <-  fam %>% rename("INDV"="V2")
+
+fam.meta <- left_join(fam, meta)
+
+fam.out <- fam.meta %>% dplyr::select(ISLAND, INDV, V3, V4, V5, V6)
+
+#write.table(fam.out, "~/Desktop/Ulit/exome/ibd/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.fam", quote = FALSE, row.names=FALSE, col.names=FALSE)
+
+
+```
+
+&nbsp;
+
+### Batch script to calc IBD using Plink
+```{bash, eval=FALSE, message=FALSE}
+#!/bin/sh 
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH -t 3:00:00
+#SBATCH --cpus-per-task=2
+#SBATCH --mem-per-cpu=2G
+#SBATCH -J ibd
+#SBATCH -o ibd.%j.out
+#SBATCH --error ibd.%j.err
+
+~/programs/plink --bfile ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD --dog --allow-extra-chr --threads 2 --genome gz --out ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD 
+
+```
+
+&nbsp;
+
+#### Plot IBD in Rstudio -- Figure S6
+```{r, warning=FALSE, message=FALSE}
+#
+ibd.df <- read.table('~/Desktop/Ulit/exome/ibd/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.ibd.genome.gz', header=TRUE)
+
+# Make col for inter vs intra island comparisons
+ibd.df$compare <- ifelse(ibd.df$FID1 == ibd.df$FID2,"intra","inter")
+ibd.df$isl.compare <- ifelse(c(ibd.df$FID1 == "CAT" & ibd.df$FID2 == "CAT"),"CAT-CAT","inter")
+ibd.df$isl.compare[c(ibd.df$FID1 == "SCL" & ibd.df$FID2 =="SCL")] <- 'SCL-SCL'
+ibd.df$isl.compare[c(ibd.df$FID1 == "SCZ" & ibd.df$FID2 =="SCZ")] <- 'SCZ-SCZ'
+ibd.df$isl.compare[c(ibd.df$FID1 == "SMI" & ibd.df$FID2 =="SMI")] <- 'SMI-SMI'
+ibd.df$isl.compare[c(ibd.df$FID1 == "SNI" & ibd.df$FID2 =="SNI")] <- 'SNI-SNI'
+ibd.df$isl.compare[c(ibd.df$FID1 == "SRI" & ibd.df$FID2 =="SRI")] <- 'SRI-SRI'
+
+ibd.df$isl.compare <- factor(ibd.df$isl.compare, levels=c("SMI-SMI", "SRI-SRI", "SCZ-SCZ", "CAT-CAT", "SCL-SCL", "SNI-SNI", "inter"))
+cols <- c("SMI-SMI" = "midnightblue", "SRI-SRI" = "royalblue2", "SCZ-SCZ" = "cadetblue2", "CAT-CAT" = "darkred", "SCL-SCL" = "firebrick1", "SNI-SNI" = "darksalmon", "inter" = "gray")
+
+# Make new columns to split apart so can have museum lables alone
+ibd.df$TIME1 <- ifelse(grepl(c("SBMNH|LANHM"), ibd.df$IID1),"Historical","Modern")
+ibd.df$TIME2 <- ifelse(grepl("SBMNH|LANHM", ibd.df$IID2),"Historical","Modern")
+
+ibd.df$TIME <- ifelse(c(ibd.df$TIME1== "Historical" & ibd.df$TIME2 == "Historical") ,"Historical","Modern")
+
+# subset for intra island pairs and make H/M column
+ibd.intra <-subset(ibd.df, subset= ibd.df$compare == "intra")
+
+
+ibd.p <- ggplot(ibd.df, aes(Z0, Z1)) + 
+  geom_point(aes(colour = factor(isl.compare)), alpha = 0.8, size = 6) +
+  labs(title = "", colour="Comparison") + #IBD by inter- vs intra- island comparisons
+  scale_color_manual(values = cols, labels=c("SMI-SMI" = "SMI-SMI*", "SRI-SRI" = "SRI-SRI*", "SCZ-SCZ" = "SCZ-SCZ*", "CAT-CAT" = "CAT-CAT*", "SCL-SCL" = "SCL-SCL", "SNI-SNI" = "SNI-SNI")) +
+  theme_bw() + theme(text = element_text(size=20))
+
+#ggsave(ibd.p, filename = "~/Desktop/Ulit/exome/ibd/bwaAln_ibd_2-5-2023.png", width = 11, height =11)
+
+ibd.p
+
+```
+
+&nbsp;
+&nbsp;
+&nbsp;
+&nbsp;
+
+# 17) Within-population stats
+## Split VCF by Island and time
+Batch script to split VCF by island and time period (~/scripts/Ulit/splitVCF.sbatch)
+```{bash, eval=FALSE, message=FALSE}
+# first split VCF into populations and pop-time VCFs
+
+cd /ocean/projects/mcb200015p/adamsne2/UlitExome/bwaAln_analyses
+
+bcftools query --list-samples ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.recode.vcf.gz | grep "CAT" > CAT_M.txt
+bcftools query --list-samples ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.recode.vcf.gz | grep "SMI" > SMI_M.txt
+bcftools query --list-samples ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.recode.vcf.gz | grep "SRI" > SRI_M.txt
+bcftools query --list-samples ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.recode.vcf.gz | grep "SCZ" > SCZ_M.txt
+bcftools query --list-samples ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.recode.vcf.gz | grep "SNI" > SNI_M.txt
+bcftools query --list-samples ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.recode.vcf.gz | grep "SCL" > SCL_M.txt
+# physically moved SCL_40749 to SNI pop file
+
+# made historical sample files by hand
+# need to fix _ to -
+for FILE in *H.txt; do sed 's/_/-/g' $FILE > ${FILE%.txt}.fix.txt; done
+
+# modern samples
+for FILE in *M.txt; do popT=`ls $FILE | cut -f1 -d '.'`; vcftools --gzvcf ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.recode.vcf.gz --keep $FILE --recode --recode-INFO-all --out ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD_$popT; done
+
+# historical samples
+for FILE in *fix.txt; do popT=`ls $FILE | cut -f1 -d '.'`; vcftools --gzvcf ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.recode.vcf.gz --keep $FILE --recode --recode-INFO-all --out ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD_$popT; done
+
+for FILE in *.vcf; do bgzip -c $FILE > $FILE.gz; done 
+
+```
+
+&nbsp;
+
+### Repeat for het, pi, TD (w/o maf)
+```{bash, eval=FALSE, message=FALSE}
+ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_hz_noLD.recode.vcf.gz
+
+cd /bwaAln_analyses/
+
+# modern samples
+for FILE in *M.txt; do popT=`ls $FILE | cut -f1 -d '.'`; vcftools --gzvcf ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_hz_noLD.recode.vcf.gz --keep $FILE --recode --recode-INFO-all --out ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_hz_noLD_$popT; done
+
+# historical samples
+for FILE in *fix.txt; do popT=`ls $FILE | cut -f1 -d '.'`; vcftools --gzvcf ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_hz_noLD.recode.vcf.gz --keep $FILE --recode --recode-INFO-all --out ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_hz_noLD_$popT; done
+
+for FILE in ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_hz_noLD_*.recode.vcf; do bgzip -c $FILE > $FILE.gz; done 
+```
+
+&nbsp;
+
+## Calculate heterozygosity
+code to calculate heterozygosity 
+```{bash, eval=FALSE, message=FALSE}
+# indiv het
+for FILE in ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_hz_noLD_*.recode.vcf.gz; do vcftools --gzvcf $FILE --het --out ${FILE%.recode.vcf.gz}; done
+
+# site het
+for FILE in ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_hz_noLD_*.recode.vcf.gz; do vcftools --gzvcf $FILE --hardy --out ${FILE%.recode.vcf.gz}; done 
+```
+
+&nbsp;
+
+### Plot individual heterozygosity in Rstudio -- Figure 2 B
+```{r, warning=FALSE, message=FALSE}
+## w/o maf
+het.files <- list.files(path="~/Desktop/Ulit/exome/Het/bwaAln_het", pattern= c("*.het"), full.names=T) # mac
+het.files <- het.files[1:12]
+
+het.list<-list()
+for (FILE in het.files) {
+  het.df <- read.table(FILE, row.names = NULL, header=TRUE)
+  #dfNamA <- unlist(strsplit(FILE, "[/|,.,_]+"))[c(20,21)]
+  dfNamA <- unlist(strsplit(FILE, "[/|,.,_]+"))[c(19,20)] # wo maf
+  dfNam <- paste(dfNamA, collapse="_")
+  
+  het.df$O.HET <- (het.df$N_SITES-het.df$O.HOM.)/het.df$N_SITES # Calc obs HET
+  
+  het.df$ISLAND <- dfNamA[1]
+  het.df$TIME <- dfNamA[2]
+    
+  het.list[[dfNam]] <- het.df
+}
+ 
+
+
+# Convert lists to dataframe
+het.all <- do.call(rbind.data.frame, het.list)
+
+
+
+# Add Island and Time and bottleneck
+het.all$ISLAND <- factor(het.all$ISLAND, levels=c("SMI", "SRI", "SCZ", "CAT", "SCL", "SNI"))
+
+het.all$TIME <- as.factor(ifelse(het.all$TIME == "H", "Historical", "Modern"))
+
+het.all$NECK <- as.factor(ifelse(het.all$ISLAND == "SMI" | het.all$ISLAND == "SRI" | het.all$ISLAND == "SCZ" | het.all$ISLAND == "CAT", "bottleneck", "none"))
+
+
+het.box.bw <- ggplot(het.all, aes(ISLAND, O.HET, color = TIME, shape=TIME)) +
+    geom_boxplot(position = position_dodge(0.8), color= "black", show.legend = F) +
+  geom_jitter(position = position_dodge(0.8), size = 6, alpha = 0.8) +
+   labs(title = "", shape= "Time") +
+  xlab("") + ylab("Observed heterozygosity\n") +
+ #scale_color_manual(values = cols) + 
+  scale_color_grey(start=0.3, end=0.6, name= "Time") +
+  scale_shape_manual(name="Time", values = c(19,17)) +
+  theme_minimal() + theme(text = element_text(size=18), axis.text.x = element_text(size = 22), axis.text.y = element_text(size = 18)) +
+  scale_x_discrete(labels=c("SMI" = "SMI*", "SRI" = "SRI*", "SCZ" = "SCZ*", "CAT" = "CAT*", "SCL" = "SCL", "SNI" = "SNI")) +
+  #ggpubr::stat_compare_means(aes(group = TIME), label = "p.format", size=4, show.legend = F)
+  ggpubr::stat_compare_means(aes(group = TIME, label = sprintf("p = %5.3f", as.numeric(..p.format..))), size=4, show.legend = F)
+  #stat_compare_means(aes(group = TIME), label = "p.signif", size=10, show.legend = F)
+
+
+het.box2 <- het.box.bw + #het.box
+  geom_segment(aes(x = 1, y = 0.58, xend = 1, yend = 0.55),
+              arrow = arrow(length = unit(0.5, "cm")), lineend = "round", linejoin = "round",
+               size=2,color="red") +
+  geom_segment(aes(x = 2, y = 0.58, xend = 2, yend = 0.55),
+              arrow = arrow(length = unit(0.5, "cm")), lineend = "round", linejoin = "round",
+               size=2,color="red") +
+  geom_segment(aes(x = 3, y = 0.55, xend = 3, yend = 0.58),
+              arrow = arrow(length = unit(0.5, "cm")), lineend = "round", linejoin = "round",
+               size=2,color="gray") +
+  geom_segment(aes(x = 4, y = 0.58, xend = 4, yend = 0.55),
+              arrow = arrow(length = unit(0.5, "cm")), lineend = "round", linejoin = "round",
+               size=2,color="gray") +
+  geom_segment(aes(x = 5, y = 0.55, xend = 5, yend = 0.58),
+              arrow = arrow(length = unit(0.5, "cm")), lineend = "round", linejoin = "round",
+               size=2,color="gray") +
+  geom_segment(aes(x = 6, y = 0.58, xend = 6, yend = 0.55),
+              arrow = arrow(length = unit(0.5, "cm")), lineend = "round", linejoin = "round",
+               size=2,color="red") 
+
+het.box2
+
+## effect size
+#library(coin)
+ het.all %>%
+  group_by(ISLAND) %>%
+  wilcox_effsize(O.HET ~ TIME)
+```
+
+&nbsp;
+
+### Plot individual heterozygosity by year and linear models in Rstudio -- Figure S4 and Table S4
+```{r, warning=FALSE, message=FALSE}
+# Het data from main figure het section
+# Load metadata 
+meta <- read.table("~/Desktop/Ulit/exome/Het/Sample_metadata_nolow.txt", header=TRUE)
+
+# merge metadata and het data
+het.meta <- merge(het.all, meta, by = c("INDV", "ISLAND", "TIME"))
+
+# define colors
+cols <- c("SMI" = "midnightblue", "SRI" = "royalblue2", "SCZ" = "cadetblue2", "CAT" = "darkred", "SCL" = "firebrick1", "SNI" = "darksalmon")
+
+# Plot het over time
+het.time <- ggplot(het.meta, aes(YEAR, O.HET, color = ISLAND, linetype = ISLAND)) +
+  geom_point(size=8, alpha=0.8) +
+   labs(title = "") +
+  xlab("Year") + ylab("Observed heterozygosity") + labs(color="Island") +
+ scale_color_manual(values = cols, labels=c("SMI" = "SMI*", "SRI" = "SRI*", "SCZ" = "SCZ*", "CAT" = "CAT*", "SCL" = "SCL", "SNI" = "SNI")) +
+  theme_bw() + theme(text = element_text(size=30)) +
+  geom_smooth(method = "lm", fill = NA, show.legend = FALSE)
+
+#ggsave(het.time, filename = "~/Desktop/Ulit/exome/Het/bwaAln_het/hetTime_woMaf_2-9-2023.png", width = 11, height =11) #wo maf
+
+het.time
+
+# Run linear models for het over time
+#library(broom)
+het.meta %>% group_by(ISLAND) %>% do(tidy(lm(O.HET ~ YEAR, .)))
+
+
+```
+
+&nbsp;
+
+### Calculate mean site heterozygosity using sliding windows (size = 100kb, step = 10kb) 
+```{r, eval=FALSE, warning=FALSE, message=FALSE}
+#library(windowscanr)
+#library(ggpubr)
+
+# Load in site heterozygosity files
+hwe.files <- list.files(path="~/Desktop/Ulit/exome/Het/bwaAln_het/", pattern="*.hwe", full.names=T) 
+
+## w/o maf
+hwe.files <- hwe.files[1:12]
+
+hwe.list <- list()
+for (FILE in hwe.files){
+  hwe.df <- as.data.frame(read.table(FILE, header = TRUE))
+  #POP <- unlist(strsplit(FILE, "[/|,.,_]+"))[c(20)] %>% paste(collapse=".") 
+  #TIME <- unlist(strsplit(FILE, "[/|,.,_]+"))[c(21)] %>% paste(collapse=".") 
+  POP <- unlist(strsplit(FILE, "[/|,.,_]+"))[c(19)] %>% paste(collapse=".") #wo maf
+  TIME <- unlist(strsplit(FILE, "[/|,.,_]+"))[c(20)] %>% paste(collapse=".") #wo maf
+  dfName <- paste(POP, TIME, sep = '.' )
+  pltName <- paste('plot', POP, TIME, sep = '.' )
+  winName <- paste(POP, TIME, 'win', sep = '.' )
+  
+  colnames(hwe.df) <- c("CHR", "POS", "OBS.HOM1.HET.HOM2.", "E.HOM1.HET.HOM2.", "ChiSq_HWE", "P_HWE", "P_HET_DEFICIT", "P_HET_EXCESS")
+  
+  chr2keep2 <- c("chr1", "chr2", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", "chr9", "chr10", "chr11", "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr19", "chr20", "chr21", "chr22", "chr23", "chr24", "chr25", "chr26", "chr27", "chr28", "chr29", "chr30", "chr31", "chr32", "chr33", "chr34", "chr35", "chr36", "chr37", "chr38")
+
+  hwe.df2 <- hwe.df %>% tidyr::separate(`OBS.HOM1.HET.HOM2.`, c("OBS.HOM1", "OBS.HET", "OBS.HOM2"), sep="/") %>%
+    tidyr::separate(`E.HOM1.HET.HOM2.`, c("E.HOM1", "E.HET", "E.HOM2"), sep="/") %>% filter(CHR %in% chr2keep2) %>%
+    mutate(ISLAND=POP, TIME=TIME) %>% droplevels()
+  
+  cols.num <- c("OBS.HOM1", "OBS.HET", "OBS.HOM2")
+  hwe.df2[cols.num] <- sapply(hwe.df2[cols.num],as.numeric)
+  
+  hwe.df2$calcHet <- (hwe.df2$OBS.HET/(hwe.df2$OBS.HOM1+hwe.df2$OBS.HOM2+hwe.df2$OBS.HET))
+  
+  # NEED to put chr in order to get correct x axis
+  hwe.df2$CHR <- factor(hwe.df2$CHR, levels = c("chr1", "chr2", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", "chr9", "chr10", "chr11", "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr19", "chr20", "chr21", "chr22", "chr23", "chr24", "chr25", "chr26", "chr27", "chr28", "chr29", "chr30", "chr31", "chr32", "chr33", "chr34", "chr35", "chr36", "chr37", "chr38"))
+  
+  #hwe.list[[ dfName ]] <- hwe.df2
+  
+  hwe.sub <- hwe.df2 %>% filter(P_HET_EXCESS > 0.05)
+  
+  hwe.list[[ dfName ]] <- hwe.sub
+  
+
+hwe_win <- winScan(x = hwe.sub,groups = "CHR", position = "POS",values = c("calcHet"),win_size = 100000,win_step = 10000,funs = c("mean"))
+
+hwe.list[[ winName ]] <- hwe_win
+
+write.table(hwe_win, paste0("~/Desktop/Ulit/exome/Het/bwaAln_het/", winName, ".txt"), row.names=FALSE, quote=FALSE, sep="\t")
+  
+  # hwe.don <- hwe.sub %>% 
+  #   # Compute chromosome size
+  #   group_by(CHR) %>% 
+  #   dplyr::summarise(chr_len=max(POS)) %>% 
+  #   # Calculate cumulative position of each chromosome
+  #   mutate(tot=cumsum(chr_len)-chr_len) %>%
+  #   dplyr::select(-chr_len) %>%
+  #   # Add this info to the initial dataset
+  #   left_join(hwe.sub, ., by=c("CHR"="CHR")) %>%
+  #   # Add a cumulative position of each SNP
+  #   arrange(CHR, POS) %>%
+  #   mutate( POS2=POS+tot)
+  # 
+  # cols.num2 <- c("POS", "tot", "POS2")
+  # hwe.don[cols.num2] <- sapply(hwe.don[cols.num2],as.numeric)
+  # 
+  # hwe.axisdf = hwe.don %>% group_by(CHR) %>% summarize(center=( max(POS2) + min(POS2) ) / 2 )
+  # 
+  # hwe.list[[ pltName ]] <- ggplot(hwe.don, aes(x=POS2, y=calcHet)) +
+  #   geom_col( aes(color=as.factor(CHR)), alpha=0.3) +
+  #   #geom_point( aes(color=as.factor(CHR)), alpha=0.8)+
+  #   scale_color_manual(values = rep(c("gray", "dodgerblue"), 22 )) +
+  # 
+  #   # custom X axis:
+  #   #scale_x_continuous( label = hwe.axisdf$CHR, breaks= hwe.axisdf$center ) +
+  #   scale_x_continuous( label = as.numeric(hwe.axisdf$CHR), breaks=as.numeric(hwe.axisdf$center)) +
+  #   scale_y_continuous(expand = c(0, 0) ) +     # remove space between plot area and x axis
+  #    ylim(0, 1) +
+  # 
+  #   # Custom the theme:
+  #   theme_bw() + labs(title = paste(POP, TIME, sep = "_"), x="Chromosome", y="OBS.HET/(OBS.HOM1+OBS.HOM2+OBS.HET)") +
+  #   theme(
+  #     legend.position="none",
+  #     panel.border = element_blank(),
+  #     panel.grid.major.x = element_blank(),
+  #     panel.grid.minor.x = element_blank(),
+  #     text = element_text(size = 14), axis.text.x = element_text(size = 12, angle = 90))
+  # 
+}
+
+
+#output the sliding-windows file
+#write.table(hwe_win, paste0(FILE,".slidingwindows"), row.names=FALSE, quote=FALSE, sep="\t")
+
+
+hwe.list[[ pltName ]] <- ggplot(hwe_win, aes(x=win_mid, y=calcHet_mean)) +
+    geom_point(alpha=0.1) +
+    facet_wrap(~CHR, scales = "free_x") +
+    theme_bw() + labs(title = paste(POP, TIME, sep = "_"), x="Chromosome", y="OBS.HET/(OBS.HOM1+OBS.HOM2+OBS.HET)")
+
+```
+
+&nbsp;
+
+### Plot mean site heterozygosity
+```{r, warning=FALSE, message=FALSE}
+hwe.win.files <- list.files(path="~/Desktop/Ulit/exome/Het/bwaAln_het", pattern="*win.txt", full.names=T)
+   
+hwe.win.list <- list()
+for (FILE in hwe.win.files){
+  win.df <- as.data.frame(read.table(FILE, header = TRUE))
+  POP <- unlist(strsplit(FILE, "[/|,.,_]+"))[c(10)] %>% paste(collapse=".") 
+  TIME <- unlist(strsplit(FILE, "[/|,.,_]+"))[c(11)] %>% paste(collapse=".") 
+  dfName <- paste(POP, TIME, sep = '.' )
+  pltName <- paste(POP, TIME, 'p', sep = '.')
+  
+  win.df$calcHet_meanPbp <- win.df$calcHet_mean/100000 #win size
+  win.df$island <- POP
+  win.df$time <- TIME
+    
+  hwe.win.list[[ dfName ]] <- win.df
+  
+  win.df$CHR <- as.factor(win.df$CHR)
+  win.df$CHR <- factor(win.df$CHR, levels=unique(win.df$CHR))
+
+hwe.win.donx <- win.df %>% 
+  # Compute chromosome size
+  group_by(CHR) %>% 
+  dplyr::summarise(chr_len=max(win_mid)) %>% 
+  # Calculate cumulative position of each chromosome
+  mutate(tot=cumsum(chr_len)-chr_len) %>%
+  dplyr::select(-chr_len) %>%
+  # Add this info to the initial dataset
+  left_join(win.df, ., by=c("CHR"="CHR")) %>%
+  # Add a cumulative position of each SNP
+  arrange(CHR, win_mid) %>%
+  mutate( POS=win_mid+tot)
+
+hwe.win.axisdfx = hwe.win.donx %>% group_by(CHR) %>% summarize(center=( max(POS) + min(POS) ) / 2 )
+
+  hwe.win.list[[ pltName ]] <- ggplot(hwe.win.donx, aes(x=POS, y=calcHet_meanPbp)) +
+    #geom_point(alpha=0.1, show.legend = F) +
+    geom_bar(alpha=0.5, stat = "identity") +
+    #scale_color_manual(values=c("red", "black", "red")) +
+    # custom X axis:
+    scale_x_continuous( label = hwe.win.axisdfx$CHR, breaks= hwe.win.axisdfx$center, guide =guide_axis(n.dodge=2) ) +
+    scale_y_continuous(expand = c(0, 0) ) + # remove space between plot area and x axis
+  ylim(0,0.9) + # so all pops are on the same y scale
+    # Custom the theme:
+    theme_bw() + labs(title =dfName) +
+    theme( 
+      legend.position="none",
+      panel.border = element_blank(),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor.x = element_blank(),
+      axis.text.x = element_text(angle = 90),
+      axis.text.y = element_text(size = 14),
+      axis.title.y = element_text(size = 14)
+    )  
+  
+}
+
+```
+
+&nbsp;
+
+#### Combine historical and modern site heterozygosity into one plot -- Figure S3
+```{r, warning=FALSE, message=FALSE}
+hwe.win.list3 <- list()
+for (NAME in names(hwe.win.list)){
+  POP <- unlist(strsplit(NAME, split = "\\."))[1]
+  TIME <- unlist(strsplit(NAME, split = "\\."))[2]
+  dfName <- paste(POP, "com", sep = '.' )
+  pltName <- paste(POP, "com", 'p', sep = '.')
+   
+win.com <- rbind(hwe.win.list[[paste0(POP, ".H")]], hwe.win.list[[paste0(POP, ".M")]])
+#win.com <- inner_join(hwe.win.list[[paste0(POP, ".H")]], hwe.win.list[[paste0(POP, ".M")]], by=c("CHR", "win_start", "win_end", "win_mid", "island")) %>% drop_na() 
+ 
+win.com$CHR <- as.factor(win.com$CHR)
+  win.com$CHR <- factor(win.com$CHR, levels=unique(win.com$CHR))
+
+hwe.win.list3[[ dfName ]] <- win.com
+
+hwe.win.don.com <- win.com %>% 
+  # Compute chromosome size
+  group_by(CHR) %>% 
+  dplyr::summarise(chr_len=max(win_mid)) %>% 
+  # Calculate cumulative position of each chromosome
+  mutate(tot=cumsum(chr_len)-chr_len) %>%
+  dplyr::select(-chr_len) %>%
+  # Add this info to the initial dataset
+  left_join(win.com, ., by=c("CHR"="CHR")) %>%
+  # Add a cumulative position of each SNP
+  arrange(CHR, win_mid) %>%
+  mutate( POS=win_mid+tot)
+
+hwe.win.axisdf.com = hwe.win.don.com %>% group_by(CHR) %>% summarize(center=( max(POS) + min(POS) ) / 2 )
+
+  hwe.win.list3[[ pltName ]] <- ggplot(hwe.win.don.com, aes(x=POS, y=calcHet_meanPbp, fill=time)) +
+    #geom_point(alpha=0.1, show.legend = F) +
+    geom_bar(alpha=0.5, stat = "identity", position = "identity") +
+    scale_fill_manual(values = c("gray22", "red")) +
+   # scale_fill_viridis_d(end=0.93) +
+    # custom X axis:
+    scale_x_continuous( label = hwe.win.axisdf.com$CHR, breaks= hwe.win.axisdf.com$center, guide =guide_axis(n.dodge=2) ) +
+    scale_y_continuous(expand = c(0, 0) ) + # remove space between plot area and x axis
+  ylim(0,9.0E-6) + # so all pops are on the same y scale
+    # Custom the theme:
+    theme_classic() + labs(title =POP, y="Heterozygosity per bp" , x="Chromosome") +
+    theme( 
+      legend.position="none",
+      panel.border = element_blank(),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor.x = element_blank(),
+      axis.text.x = element_text(angle = 90),
+      axis.text.y = element_text(size = 14),
+      axis.title.y = element_text(size = 14)
+    )  
+
+}
+
+# hwe.win.com.N <- cowplot::plot_grid(hwe.win.list3$SMI.com.p, hwe.win.list3$SRI.com.p, hwe.win.list3$SCZ.com.p, ncol = 1)
+# hwe.win.com.S <- cowplot::plot_grid(hwe.win.list3$CAT.com.p, hwe.win.list3$SCL.com.p, hwe.win.list3$SNI.com.p, ncol = 1)
+# ggsave(hwe.win.com.N, filename = "~/Desktop/Ulit/exome/Het/winHetcom_N_5-12-2022.png", width = 11, height =11)
+# ggsave(hwe.win.com.S, filename = "~/Desktop/Ulit/exome/Het/winHetcom_S_5-12-2022.png", width = 11, height =11)
+
+
+hwe.win.com.N <- ggarrange(hwe.win.list3$SMI.com.p + theme(axis.title.x= element_blank(), axis.text.x= element_blank(), axis.title.y= element_blank()), hwe.win.list3$SRI.com.p + theme(axis.title.y = element_blank(), axis.text.x= element_blank(), axis.title.x= element_blank()), hwe.win.list3$SCZ.com.p + theme(axis.title.y = element_blank(), axis.text.x= element_blank(), axis.title.x= element_blank()),labels = c("A", "B", "C"), ncol = 1)
+hwe.win.com.N2 <- annotate_figure(hwe.win.com.N, left=text_grob("Heterozygosity (per Kb)", rot = 90))
+
+hwe.win.com.S <- ggarrange(hwe.win.list3$CAT.com.p + theme(axis.title.x= element_blank(), axis.text.x= element_blank(), axis.title.y= element_blank()), hwe.win.list3$SCL.com.p + theme(axis.title.y = element_blank(), axis.text.x= element_blank(), axis.title.x= element_blank()), hwe.win.list3$SNI.com.p + theme(axis.title.y = element_blank()),labels = c("D", "E", "F"), ncol = 1)
+hwe.win.com.S2 <- annotate_figure(hwe.win.com.S, left=text_grob("Heterozygosity (per Kb)", rot = 90))
+
+hwe.win.com.all <- egg::ggarrange(hwe.win.list3$SMI.com.p + theme(axis.title.x= element_blank(), axis.text.x= element_blank(), axis.title.y= element_blank()), hwe.win.list3$SRI.com.p + theme(axis.title.y = element_blank(), axis.text.x= element_blank(), axis.title.x= element_blank()), hwe.win.list3$SCZ.com.p + theme(axis.title.y = element_blank(), axis.text.x= element_blank(), axis.title.x= element_blank()), 
+                             hwe.win.list3$CAT.com.p + theme(axis.title.x= element_blank(), axis.text.x= element_blank(), axis.title.y= element_blank()), hwe.win.list3$SCL.com.p + theme(axis.title.y = element_blank(), axis.text.x= element_blank(), axis.title.x= element_blank()), hwe.win.list3$SNI.com.p + theme(axis.title.y = element_blank()), ncol = 1)
+hwe.win.com.all2 <- annotate_figure(hwe.win.com.all, left=text_grob("Heterozygosity (per Kb)", rot = 90))
+
+# ggsave(hwe.win.com.all2, filename = "~/Desktop/Ulit/exome/Het/bwaAln_het/winHetcom_woMaf_all_2-10-2023.png", width = 11, height =11)
+
+hwe.win.com.all2
+
+```
+
+&nbsp;
+&nbsp;
+
+## Calculate nucleotide diversity using Pixy
+Note that Pixy needs variant and INvariant sites to calculate pi so in the above VCF generation and filtering there are steps specifically for generating and filtering VCFs that will keep invariant sites.
+
+&nbsp;
+
+Create list of chromosomes/scaffolds to loop over to decrease computational time
+```{bash, eval=FALSE, message=FALSE}
+module load GNU/6.4.0-2.28  OpenMPI/2.1.2 bcftools/1.9.64 
+ 
+bcftools query -f '%CHROM\n' ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_hz_noLD.recode.vcf.gz | uniq > ulit.chrList.txt
+
+```
+
+&nbsp;
+
+### Batch script to calculate nucleotide diversity in 10kb windows with Pixy
+```{bash, eval=FALSE, message=FALSE}
+#!/bin/bash -l 
+#SBATCH --nodes=1
+#SBATCH --ntasks=8
+#SBATCH -t 1:00:00
+#SBATCH --cpus-per-task=1
+#SBATCH --mem-per-cpu=2G
+#SBATCH -J pixy
+#SBATCH -o pixy.%j.out
+#SBATCH --error pixy.%j.err
+
+
+conda activate pixy_env
+
+module load HTSlib/1.9
+
+CHR=$1
+
+pixy --stats pi dxy --vcf ulit_bwaAln.merged_filtered.miss75_4Pixy.vcf.gz --populations sampleMap_meta_I_T.txt --window_size 10000 --n_cores 8 --chromosomes $CHR --output_folder pixy_10kb_output --output_prefix ulit_"$CHR"\_10kb 
+```
+
+&nbsp;
+
+#### Loop to calculate nucleotide diversity per chromosome/scaffold
+```{bash, eval=FALSE, message=FALSE}
+#test one
+cat ulit.chrList.txt | head -1 | while read CHR; do echo $CHR; sbatch pixy.sbatch $CHR; done
+
+#loop all
+cat ulit.chrList.txt | while read CHR; do echo $CHR; sbatch pixy.sbatch $CHR; done
+
+```
+
+&nbsp;
+
+#### Plot nucleotide diversity -- Figure 2 A
+```{r, warning=FALSE, message=FALSE}
+# function to input data (from https://pixy.readthedocs.io/en/latest/plotting.html)
+pixy_to_long <- function(pixy_files){
+
+  pixy_df <- list()
+
+  for(i in 1:length(pixy_files)){
+
+    stat_file_type <- gsub(".*_|.txt", "", pixy_files[i])
+
+    if(stat_file_type == "pi"){
+
+      df <- read_delim(pixy_files[i], delim = "\t")
+      df <- df %>%
+        gather(-pop, -window_pos_1, -window_pos_2, -chromosome,
+               key = "statistic", value = "value") %>%
+        rename(pop1 = pop) %>%
+        mutate(pop2 = NA)
+
+      pixy_df[[i]] <- df
+
+
+    } else{
+
+      df <- read_delim(pixy_files[i], delim = "\t")
+      df <- df %>%
+        gather(-pop1, -pop2, -window_pos_1, -window_pos_2, -chromosome,
+               key = "statistic", value = "value")
+      pixy_df[[i]] <- df
+
+    }
+
+  }
+
+  bind_rows(pixy_df) %>%
+    arrange(pop1, pop2, chromosome, window_pos_1, statistic)
+
+}
+
+# load in pixy data
+pixy_folder <- "~/Desktop/Ulit/exome/forPixy/pixy_10kb"
+pixy_files <- list.files(pixy_folder, full.names = TRUE, pattern = "*pi.txt")
+pixy_df <- pixy_to_long(pixy_files)
+
+# data wrangling
+pixy_df2 <- pixy_df %>% mutate(ISLAND=pop1) %>% separate(ISLAND, into = c("ISLAND", "TIME"))
+pixy_df2$NECK <- as.factor(ifelse(pixy_df2$ISLAND == "SMI" | pixy_df2$ISLAND == "SRI" | pixy_df2$ISLAND == "SCZ" | pixy_df2$ISLAND == "CAT", "bottleneck", "none"))
+
+pixy.pi <- pixy_df2 %>% filter(statistic %in% c("avg_pi")) %>% filter(!is.na(value)) #%>% filter(!chromosome=="chrX") #keep chrX
+pixy.pi$ISLAND <- factor(pixy.pi$ISLAND, levels=c("SMI", "SRI", "SCZ", "CAT", "SCL", "SNI"))
+
+# summary stats
+#pixy.pi %>% group_by(ISLAND, TIME) %>% summarise(med=median(value)) 
+pixy.pi %>% group_by(ISLAND, TIME) %>% summarise(mean=mean(value)) 
+
+wwList <- c()
+for (ISL in unique(pixy.pi$ISLAND)) {
+  ww.test <- wilcox.test(value ~ TIME, data = pixy.pi %>% filter(ISLAND==ISL))
+  wwList[[ISL]] <- data.frame(ISLAND=ISL, testStat=ww.test$statistic, pval=ww.test$p.value)
+}
+
+wwList.df <- do.call(rbind, wwList)
+
+## effect size
+#library(rstatix)
+ pixy.pi %>%
+ # filter(ISLAND=="SMI") %>%
+  group_by(ISLAND) %>%
+  wilcox_effsize(value ~ TIME)
+
+ pixyList <- c()
+for (POP in unique(pixy.pi$ISLAND)){
+  ISLH <- paste0(POP, "_Historical")
+  ISLM <- paste0(POP, "_Modern")
+  wtest <- paste0(POP, ".wilcox")
+  
+  pixy_H <- pixy_df %>% filter(pop1==ISLH) %>% #spread(statistic,value)
+    filter(statistic %in% c("avg_pi")) 
+  pixy_M <- pixy_df %>% filter(pop1==ISLM) %>% #spread(statistic,value)
+    filter(statistic %in% c("avg_pi")) 
+  pixy_tmp <- pixy_df2 %>% filter(ISLAND==POP) %>% #spread(statistic,value)
+    filter(statistic %in% c("avg_pi")) 
+  
+  pixy_H.t  <- pixy_H %>% summarise(avgPi=mean(value, na.rm = T), sd=sd(value, na.rm = T))
+  pixy_M.t  <- pixy_M %>% summarise(avgPi=mean(value, na.rm = T), sd=sd(value, na.rm = T))
+  
+  pixyList[[wtest]] <- wilcox.test(pixy_H$value, pixy_M$value)
+   
+  pixyList[[ISLH]] <- pixy_H.t
+  pixyList[[ISLM]] <- pixy_M.t
+}
+
+# plot distributions of pi a la Pedro Andrade et al. rabbit paper
+cols12b <- c( "midnightblue",  "midnightblue",  "royalblue2", "royalblue2",  "cadetblue2",  "cadetblue2",  "darkred",  "darkred",  "firebrick1",  "firebrick1", "darksalmon", "darksalmon")
+
+pixy.pi <- pixy.pi %>% mutate(pop1b= gsub("Historical", "H", pop1), pop1c= gsub("Modern", "M", pop1b))
+pixy.pi$pop1c <- factor(pixy.pi$pop1c, levels=c("SMI_H","SMI_M", "SRI_H","SRI_M", "SCZ_H","SCZ_M", "CAT_H", "CAT_M", "SCL_H", "SCL_M", "SNI_H", "SNI_M"))
+pixy.pi <- pixy.pi %>% mutate(label=pop1c)
+pixy.pi$label <- str_replace_all(pixy.pi$label, c("SMI_H"="SMI* (H)", "SMI_M"="SMI* (M)",
+    "SRI_H"="SRI* (H)", "SRI_M"="SRI* (M)",
+    "SCZ_H"="SCZ* (H)", "SCZ_M"="SCZ* (M)",
+    "CAT_H"="CAT* (H)", "CAT_M"="CAT* (M)",
+    "SCL_H"="SCL (H)", "SCL_M"="SCL (M)",
+    "SNI_H"="SNI (H)", "SNI_M"="SNI (M)"))
+
+pixy.label <- data.frame(pop1c=levels(pixy.pi$pop1c), label=c("SMI* (H)", "SMI* (M)", "SRI* (H)", "SRI* (M)","SCZ* (H)", "SCZ* (M)", "CAT* (H)", "CAT* (M)","SCL (H)", "SCL (M)","SNI (H)", "SNI (M)"))
+pixy.label$label <- factor(pixy.label$label, levels=c("SMI* (H)", "SMI* (M)", "SRI* (H)", "SRI* (M)","SCZ* (H)", "SCZ* (M)", "CAT* (H)", "CAT* (M)","SCL (H)", "SCL (M)","SNI (H)", "SNI (M)"))
+pixy.label$pop1c <-factor(pixy.label$pop1c, levels = c(levels(pixy.pi$pop1c)))
+
+pixy.means <- pixy.pi %>% group_by(pop1c) %>% summarize(meanPi=mean(value))
+
+pixy.den.p <- ggplot(pixy.pi, aes(x=log10(value))) +
+  geom_density(aes(fill=pop1c, alpha=06)) +
+  xlab(paste("Nucleotide diversity (log10(\u03C0))")) + ylab("Density") +
+  geom_vline(data=pixy.means, aes(xintercept=log10(meanPi)), color="black", linetype="dashed") +
+  scale_y_continuous(n.breaks = 4) +
+  facet_wrap(~pop1c, ncol = 1) +
+  scale_fill_manual(values = cols12b) +
+  #theme_minimal() +
+  theme_classic() +
+  theme(text = element_text(size=18), legend.position = "none", axis.text.y = element_text(size = 10),
+        strip.text = element_blank()) +
+  geom_text(data=pixy.label, aes(label = label,  x=-5, y=0.7,  size=16)) 
+  
+  
+
+#ggsave(pixy.den.p, filename = "~/Desktop/Ulit/exome/forPixy/pixy_10kb/pixy.10kb.density_4-24-2023.png", width = 11, height =11)
+
+pixy.den.p
+
+```
+
+&nbsp;
+&nbsp;
+
+## Calculate Fst
+```{bash, eval=FALSE, message=FALSE}
+LIST=$'SMI_M.txt\n 
+SRI_M.txt\n 
+SCZ_M.txt\n 
+CAT_M.txt\n 
+SCL_M.txt\n 
+SNI_M.txt' 
+ 
+for POP1 in $LIST; 
+do 
+NAM1=`ls $POP1 |cut -f1 -d'_'`; 
+for POP2 in $LIST; 
+do 
+NAM2=`ls $POP2 |cut -f1 -d'_'`; 
+if [ "$POP1" \< "$POP2" ] 
+then 
+vcftools --gzvcf ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.recode.vcf.gz --weir-fst-pop $POP1 --weir-fst-pop $POP2 --out fst_1-15-2023/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD."$NAM1"."$NAM2"."M"; 
+fi 
+done 
+done 
+ 
+LIST2=$'SMI_H.fix.txt\n 
+SRI_H.fix.txt\n 
+SCZ_H.fix.txt\n 
+CAT_H.fix.txt\n 
+SCL_H.fix.txt\n 
+SNI_H.fix.txt' 
+ 
+for POP1 in $LIST2; 
+do 
+NAM1=`ls $POP1 |cut -f1 -d'_'`; 
+for POP2 in $LIST2; 
+do 
+NAM2=`ls $POP2 |cut -f1 -d'_'`; 
+if [ "$POP1" \< "$POP2" ] 
+then 
+vcftools --gzvcf ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.recode.vcf.gz --weir-fst-pop $POP1 --weir-fst-pop $POP2 --out fst_1-15-2023/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD."$NAM1"."$NAM2"."H"; 
+fi 
+done 
+done 
+ 
+ 
+# combine file results 
+cd fst_1-15-2023/
+ls *.log |  awk -F "." '{print $6"."$7 "."$8 }' |  sort | uniq | while read -r LINE  
+do  
+pair=$(echo $LINE)  
+dat=$(cat ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD."$LINE"*.log | grep "estimate:" | cut -d" " -f7,14)  
+echo $pair "Fst" "weightedFst" $dat >> pairwiseFst_1-15-2023.txt  
+done   
+ 
+```
+
+&nbsp;
+
+### Plot Fst heatmap -- Figure 3 and Table S7
+```{r, warning=FALSE, message=FALSE}
+#library(readxl)
+
+# Set up island names
+pops <- c("SMI", "SRI", "SCZ", "CAT", "SCL", "SNI")
+pop.combo <- t(combn(c(pops), 2)) # should have 15 combos per time period, 30 total
+
+
+# reordered pairwise weighted Fst in excel then put them here
+fstH <- as.data.frame(read_xlsx("~/Desktop/Ulit/exome/Fst/bwaAln_fst/pairwiseFst_sorted_1-15-2023.xlsx", sheet = "historical"))
+rownames(fstH) <- fstH$...1
+drops <- "...1"
+fstH2 <- fstH[ , !(names(fstH) %in% drops)]
+fstH2[is.na(fstH2)] <- 0
+
+fstM <- as.data.frame(read_xlsx("~/Desktop/Ulit/exome/Fst/bwaAln_fst/pairwiseFst_sorted_1-15-2023.xlsx", sheet = "modern"))
+rownames(fstM) <- fstM$...1
+fstM2 <- fstM[ , !(names(fstM) %in% drops)]
+fstM2[is.na(fstM2)] <- 0
+
+fstH.mat <- fstH2 %>% as.matrix
+fstM.mat <- fstM2 %>% as.matrix
+
+fst.dif <- fstM.mat-fstH.mat
+
+melted_fst.dif <- reshape2::melt(fst.dif, na.rm = TRUE)
+
+# Heatmap
+fst.p <- ggplot(data = melted_fst.dif, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white") +
+  geom_tile(data = melted_fst.dif %>% filter(value >0), fill = NA, color = "black", size = 1) +
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, space = "Lab", #limit = c(-0.05,0.05)
+   name="Fst Modern - Fst Historical") + xlab("") +ylab("")+
+  theme_bw()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 22, hjust = 1), axis.text.y = element_text(size = 22), text = element_text(size=18))+
+  scale_x_discrete(labels=c("SMI" = "SMI*", "SRI" = "SRI*", "SCZ" = "SCZ*", "CAT" = "CAT*", "SCL" = "SCL", "SNI" = "SNI")) +
+   scale_y_discrete(labels=c("SMI" = "SMI*", "SRI" = "SRI*", "SCZ" = "SCZ*", "CAT" = "CAT*", "SCL" = "SCL", "SNI" = "SNI")) +
+ coord_fixed() +guides(fill = guide_colorbar(barwidth = 1, barheight = 8.5))
+
+#ggsave(fst.p, filename = "~/Desktop/Ulit/exome/Fst/bwaAln_fst/weightedFst_heatmap_1-15-2023.png", width = 11, height =11)
+
+fst.p
+
+```
+
+&nbsp;
+&nbsp;
+
+## Calculate runs of homozygosity (ROH) using Plink
+```{bash, eval=FALSE, message=FALSE}
+ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD_CAT_H.recode.vcf.gz
+
+for FILE in ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD_*.recode.vcf.gz 
+do 
+~/programs/plink --vcf $FILE --chr-set 38 --double-id --allow-extra-chr --make-bed --out roh/${FILE%.recode.vcf.gz} 
+done 
+ 
+ 
+# Calc ROH in Plink 
+# with default parameters (--homozyg) there were 0 ROH in all of the populations 
+# Change parameters (this paper) published paper 
+ 
+for FILE in *.bed 
+do 
+~/programs/plink --bfile ${FILE%.*} --dog --allow-extra-chr --allow-no-sex --homozyg-snp 50 --homozyg-kb 300 --homozyg-density 50 --homozyg-gap 1000 --homozyg-window-snp 50 --homozyg-window-het 2 --homozyg-window-missing 5 --homozyg-window-threshold 0.05 --out ${FILE%.*} 
+done 
+
+
+#scp adamsne2@bridges2.psc.xsede.org:"/ocean/projects/mcb200015p/adamsne2/UlitExome/bwaAln_analyses/roh/*hom.indiv" .
+```
+
+&nbsp;
+
+### Examine ROH in Rstudio -- Figure S5
+```{r, warning=FALSE, message=FALSE}
+ROH.files <- list.files(path="~/Desktop/Ulit/exome/roh/", pattern="ulit_bwaAln.*hom.indiv", full.names=T) # *** use this ***
+
+# create an empty list that will serve as a container to receive the incoming files
+ROH.list<-list()
+
+# create a loop to read in your data
+for (i in 1:length(ROH.files))
+{
+  ROH.list[[i]]<-read.table(ROH.files[i], row.names = NULL, header=TRUE)
+}
+
+# add the names of your data to the list
+names(ROH.list)<-c("CAT_H", "CAT_M", "SCL_H", "SCL_M", "SCZ_H", "SCZ_M", "SMI_H", "SMI_M", "SNI_H", "SNI_M", "SRI_H", "SRI_M")
+
+# Convert lists to dataframe
+ROH.df <- do.call(rbind.data.frame, ROH.list)
+
+ROH.df$FID <- rownames(ROH.df)
+ROH.df2 <- ROH.df %>% separate(FID, into = c("FID", "stuff"), sep="[.]", extra = "merge") %>% mutate(TIME=FID) %>% separate(TIME, into = c("ISLAND", "TIME"), sep="_", extra = "merge") %>% dplyr::select(-stuff)
+
+ROH.df2$ISLAND <- as.factor(ROH.df2$ISLAND)
+ROH.df2$ISLAND<-factor(ROH.df2$ISLAND, levels=c("SMI", "SRI", "SCZ", "CAT", "SCL", "SNI"))
+ROH.df2$NECK <- as.factor(ifelse(ROH.df2$ISLAND == "SMI" | ROH.df2$ISLAND == "SRI" | ROH.df2$ISLAND == "SCZ" | ROH.df2$ISLAND == "CAT", "bottleneck", "none"))
+
+# Plot Number of ROH by island and time
+cols <- c("SMI" = "midnightblue", "SRI" = "royalblue2", "SCZ" = "cadetblue2", "CAT" = "darkred", "SCL" = "firebrick1", "SNI" = "darksalmon")
+
+ROH.a <- ggplot(ROH.df2, aes(ISLAND, NSEG, color = ISLAND, shape= TIME)) +
+  #geom_boxplot(position = position_dodge(0.8), alpha=0.9, color= "black", show.legend = F) +
+  geom_jitter(position = position_dodge(width = 0.8), size = 6, show.legend = F) + 
+  labs(title = "") + xlab("") + ylab("ROH/sample") + scale_color_manual(values = cols, guide="none") +
+  scale_x_discrete(labels=c("SMI" = "SMI*", "SRI" = "SRI*", "SCZ" = "SCZ*", "CAT" = "CAT*", "SCL" = "SCL", "SNI" = "SNI")) +
+  theme_bw() + theme(text = element_text(size=20), axis.text.x = element_text(size=18), axis.title.y = element_text(size=20)) +
+ggpubr::stat_compare_means(aes(group = TIME), label = "p.format", size=4, show.legend = F)
+  
+
+# Plot avg length and ratio of avg length/total length for island and time
+#ROH.sub <-ROH.df2 %>% filter(NSEG > 0)
+facLabs <- c("SMI" = "SMI*", "SRI" = "SRI*", "SCZ" = "SCZ*", "CAT" = "CAT*", "SCL" = "SCL", "SNI" = "SNI")
+
+# ROH.b <- ggplot(ROH.df2, aes(TIME, KBAVG, color = ISLAND, shape = TIME)) + 
+#   geom_jitter(position = position_dodge(width = 0.8), size = 6) + 
+#   labs(title = "", fill="Time") + xlab("") + ylab("length (kb)") + 
+#   scale_color_manual(values = cols) + 
+#   scale_x_discrete(labels=c("Historical" = "H", "Modern" = "M")) +
+#   theme_bw() + theme(legend.position="none", text = element_text(size=20), axis.text.x = element_text(size=18),
+#                      strip.background = element_blank()) +
+#   facet_wrap(~ISLAND, labeller = as_labeller(facLabs), nrow = 1) +
+# ggpubr::stat_compare_means(aes(group = TIME), label = "p.format", size=4, show.legend = F)
+
+ROH.b <- ggplot(ROH.df2, aes(ISLAND, KBAVG, color = ISLAND, shape = TIME)) + 
+  geom_jitter(position = position_dodge(width = 0.8), size = 6) + 
+  labs(title = "", fill="Time") + xlab("") + ylab("length (kb)") + 
+  scale_color_manual(values = cols) + 
+  scale_x_discrete(labels=c("SMI" = "SMI*", "SRI" = "SRI*", "SCZ" = "SCZ*", "CAT" = "CAT*", "SCL" = "SCL", "SNI" = "SNI")) +
+  theme_bw() + theme(legend.position="none", text = element_text(size=20), axis.text.x = element_text(size=18),
+                     strip.background = element_blank()) +
+  #facet_wrap(~ISLAND, labeller = as_labeller(facLabs), nrow = 1) +
+ggpubr::stat_compare_means(aes(group = TIME), label = "p.format", size=4, show.legend = F)
+
+
+# plot of length vs number
+ROH.c <- ggplot(ROH.df2, aes(KB, NSEG)) +
+  geom_point(aes(shape=TIME, color=ISLAND), alpha=0.8, size=6, show.legend = F) +
+  labs(title = "") + 
+  xlab("Length ROH") + ylab("Number ROH") +
+  scale_shape_manual(values=c(21, 24)) +
+  guides(fill = guide_legend(override.aes=list(shape=21)))+
+  scale_color_manual(values = cols) +
+  theme_bw() + theme(text = element_text(size=20),
+                     axis.text.x = element_text(size=16, angle = 45, vjust = 0.9, hjust = 0.9),
+                     strip.background = element_blank()) +
+  geom_smooth(method = "lm", color="black", linetype="dashed", size=0.5, fill="gray80") + 
+  #ggpubr::stat_cor() +
+  ggpmisc::stat_fit_glance(method = 'lm',
+                     method.args = list(formula = y ~ x),  geom = 'text', 
+                     aes(label = paste0("R^2=", signif(..r.squared.., digits = 2), "\n",
+                                        "p=", signif(..p.value.., digits = 2))),
+                     size = 3.5, label.x = 5.5e5, label.y = 575) +
+  facet_wrap(~ISLAND, labeller = as_labeller(facLabs), nrow = 1) 
+
+ROH.p <- cowplot::plot_grid(ROH.a, ROH.b, ROH.c, labels = c("A", "B", "C"), label_size = 16)
+
+#ggsave(ROH.p, filename = "~/Desktop/Ulit/exome/roh/bwaAln_roh_2-2-2023.png", width = 13, height =11)
+#ggsave(ROH.p, filename = "~/Desktop/Ulit/exome/roh/bwaAln_roh_2-10-2023.png", width = 13, height =11) # wo maf
+#ggsave(ROH.p, filename = "~/Desktop/Ulit/exome/roh/bwaAln_roh_wP_2-15-2023.png", width = 13, height =11) # wo maf, with lm + pvalues
+
+#### stats
+ROH.df2 %>% group_by(ISLAND, TIME) %>% summarise(SUM= sum(NSEG), MEAN= mean(NSEG), SD=sd(NSEG))
+
+
+ROH.df2 %>% group_by(ISLAND) %>% do(broom::tidy(wilcox.test(NSEG ~ TIME, .)))
+ROH.df2 %>% group_by(ISLAND) %>% do(broom::tidy(wilcox.test(KBAVG ~ TIME, .)))
+
+
+ROH.p
+
+```
+
+&nbsp;
+&nbsp;
+
+## Calculate Tajima's D using VCFtools
+```{bash, eval=FALSE, message=FALSE}
+for FILE in ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_hz_noLD_*.recode.vcf.gz 
+do 
+vcftools --gzvcf $FILE --TajimaD 100 --out tajD/${FILE%.vcf.gz} 
+done 
+ 
+# remove TajD=nan in file before DL to laptop 
+for FILE in ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_hz_noLD_*.recode.Tajima.D
+do 
+grep -v "nan" $FILE > ${FILE}.noNA 
+done 
+ 
+ #scp adamsne2@bridges2.psc.xsede.org:"/ocean/projects/mcb200015p/adamsne2/UlitExome/bwaAln_analyses/tajD/ulit_bwaAln.merged_1filter.miss75.imiss75_IDs_hz_noLD_*.recode.Tajima.D.noNA" .
+```
+
+&nbsp;
+
+### Examine Tajima's D in Rstudio -- Table S5
+```{r, warning=FALSE, message=FALSE}
+# wo maf
+TD.files <- list.files(path="~/Desktop/Ulit/exome/TajD/bwaAln_TajD/", pattern="ulit_bwaAln.*.Tajima.D.noNA", full.names=T)
+
+
+# create an empty list that will serve as a container to receive the incoming files
+TD.list<-list()
+
+# create a loop to read in your data
+for (i in 1:length(TD.files))
+{
+  TD.list[[i]]<-read.table(TD.files[i], row.names = NULL, header=TRUE)
+}
+
+# add the names of your data to the list
+names(TD.list)<-c("CAT_H", "CAT_M", "SCL_H", "SCL_M", "SCZ_H", "SCZ_M", "SMI_H", "SMI_M", "SNI_H", "SNI_M", "SRI_H", "SRI_M")
+
+# Convert lists to dataframe
+Taj.df <- do.call(rbind.data.frame, TD.list)
+
+#Taj.df <- na.omit(Taj.df)
+
+# Add Island and Time
+Taj.df$ISLAND <- rownames(Taj.df)
+Taj.df <- separate(Taj.df, ISLAND, into = c("ISLAND", "TIME"), sep = "_", extra = "merge")
+Taj.df <- separate(Taj.df, TIME, into = c("TIME", "row"), sep = "[.]", extra = "merge")
+
+Taj.df$ISLAND <- factor(Taj.df$ISLAND, levels=c("SMI", "SRI", "SCZ", "CAT", "SCL", "SNI"))
+Taj.df$TIME <- as.factor(Taj.df$TIME)
+
+Taj.df %>%
+  group_by(ISLAND, TIME) %>%
+  summarise(mean=mean(TajimaD), sd=sd(TajimaD))
+
+
+```
+
+&nbsp;
+&nbsp;
+
+## Calculate linkage disequilibrium (LD) using Plink
+```{bash, eval=FALSE, message=FALSE}
+# split files into island and time
+# modern samples
+for FILE in *M.txt; do popT=`ls $FILE | cut -f1 -d '.'`; vcftools --gzvcf ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz.recode.vcf.gz --keep $FILE --recode --recode-INFO-all --out ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_$popT; done
+
+# historical samples
+for FILE in *fix.txt; do popT=`ls $FILE | cut -f1 -d '.'`; vcftools --gzvcf ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz.recode.vcf.gz --keep $FILE --recode --recode-INFO-all --out ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_$popT; done
+
+for FILE in ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_*.recode.vcf; do bgzip -c $FILE > $FILE.gz; done 
+
+# make bed files
+for FILE in `ls ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz*.recode.vcf.gz | grep -v "LD"` 
+do 
+~/programs/plink --vcf $FILE --dog --double-id --allow-extra-chr --make-bed --out linkD/${FILE%.recode.vcf.gz} 
+done 
+ 
+# calc LD
+cd linkD/
+
+for FILE in *.bed 
+do 
+~/programs/plink --bfile ${FILE%.bed} --dog --allow-extra-chr --r2 dprime --ld-window-kb 10 --ld-window-r2 0 --out ${FILE%.bed} 
+done 
+
+```
+
+&nbsp;
+
+### Plot LD in Rstudio -- Figure S2
+```{r, warning=FALSE, message=FALSE}
+LD.files <- list.files(path="~/Desktop/Ulit/exome/LD/", pattern=".ld", full.names=T)
+
+# create an empty list that will serve as a container to receive the incoming files
+LD.list<-list()
+
+# create a loop to read in your data
+for (i in 1:length(LD.files))
+{
+  LD.list[[i]]<-read.table(LD.files[i], row.names = NULL, header=TRUE)
+}
+
+# add the names of your data to the list
+names(LD.list)<-c("CAT_H", "CAT_M", "SCL_H", "SCL_M", "SCZ_H", "SCZ_M", "SMI_H", "SMI_M", "SNI_H", "SNI_M", "SRI_H", "SRI_M")
+
+# Convert lists to dataframe
+LD.df <- do.call(rbind.data.frame, LD.list)
+LD.df <- na.omit(LD.df)
+
+# Add Island and Time
+LD.df$ISLAND <- rownames(LD.df)
+LD.df <- separate(LD.df, ISLAND, into = c("ISLAND", "TIME"), sep = "_", extra = "merge")
+LD.df <- separate(LD.df, TIME, into = c("TIME", "row"), sep = "[.]", extra = "merge")
+
+LD.df$ISLAND <- factor(LD.df$ISLAND, levels=c("SMI", "SRI", "SCZ", "CAT", "SCL", "SNI"))
+LD.df$TIME <- as.factor(LD.df$TIME)
+levels(LD.df$TIME) <- c("Historical", "Modern")
+
+LD.df %>%
+  group_by(ISLAND, TIME) %>%
+  summarise(meanr2 = mean(R2), sd= sd(R2))
+
+
+facLabs <- c("SMI" = "SMI*", "SRI" = "SRI*", "SCZ" = "SCZ*", "CAT" = "CAT*", "SCL" = "SCL", "SNI" = "SNI")
+
+LD.p <- ggplot(LD.df, aes(R2, fill = TIME)) + geom_histogram(alpha=0.7, position="dodge") + 
+  scale_fill_grey(name="", na.value = "black", start=0.2, end=0.7) +
+  labs(title = "") + xlab("R2") +
+  theme_bw() + theme(text = element_text(size=18),
+                     strip.background = element_blank()) + 
+  facet_wrap(~ISLAND, labeller = as_labeller(facLabs))
+
+#ggsave(LD.p, filename="~/Desktop/Ulit/exome/LD/LDplot_2-6-23.png", width=10, height=6, units="in")
+
+LD.p
+
+```
+
+&nbsp;
+&nbsp;
+
+## Calculate effective population size (Ne)
+### Get only synonymous variants
+```{bash, eval=FALSE, message=FALSE}
+cd /ocean/projects/mcb200015p/adamsne2/UlitExome/bwaAln_analyses
+
+# I was getting a mismatch java version error so I downloaded java version 11 to programs so it would match the java that snpEff was compiled under
+~/programs/jdk-11/bin/java -jar ~/programs/snpEff/snpEff.jar databases | grep -i "CanFam"
+
+
+for FILE in *.recode.vcf.gz 
+do 
+~/programs/jdk-11/bin/java -Xmx4g -Xms4g -jar ~/programs/snpEff/snpEff.jar CanFam3.1.99 $FILE -stats ${FILE%.rcode.vcf.gz}.html > ${FILE%.recode.vcf.gz}.ann.vcf 
+done 
+
+# filter only synonymous variants i.e. gsnap.concat.BA.DP3.CAT_H.miss.9.LD.ann.vcf  
+for FILE in *.ann.vcf 
+do 
+~/programs/jdk-11/bin/java -jar ~/programs/snpEff/SnpSift.jar filter "(ANN[*].EFFECT has 'synonymous_variant')" $FILE > ${FILE%.ann.vcf}.ann.SYN.vcf 
+done 
+
+# How many SNPs? 
+for FILE in *.SYN.vcf; do echo $FILE; grep 'synonymous_variant' $FILE |wc -l; done
+# N=6322 for all bc they were filtered the same
+
+
+######## Do it combined! NOO LD pruning!!!!  *** use this ***
+~/programs/jdk-11/bin/java -Xmx4g -Xms4g -jar ~/programs/snpEff/snpEff.jar CanFam3.1.99 ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz.recode.vcf.gz -stats ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz.html > ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz.ann.vcf 
+
+# .ann.vcf has 351662 snps
+
+# filter SNPs
+~/programs/jdk-11/bin/java -jar ~/programs/snpEff/SnpSift.jar filter "(ANN[*].EFFECT has 'synonymous_variant')" ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz.ann.vcf > ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz.ann.SYN.vcf 
+
+grep -v "^##" ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz.ann.SYN.vcf | cut -f1,3 > ../bwaAln_vcfs/ulit_snpMap4Ne_wLD.txt
+
+# 26527 snps
+
+# check number of non-synon snps
+~/programs/jdk-11/bin/java -jar ~/programs/snpEff/SnpSift.jar filter "(ANN[*].EFFECT has 'missense_variant')" ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz.ann.vcf > ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz.ann.MISSSYN.vcf
+
+grep -v "^##" ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz.ann.MISSSYN.vcf|wc -l
+# 26885 snps
+
+```
+
+&nbsp;
+
+#### Make sample map file for Ne
+```{r, warning=FALSE, message=FALSE}
+ne.dat <- read.delim("~/Desktop/Ulit/exome/Ne/sampleMap4Ne.txt", header = F)
+
+meta <- read.table("~/Desktop/Ulit/exome/Het/Sample_metadata_nolow.txt", header=TRUE)
+
+ne.dat <- ne.dat %>% rename("INDV"="V1")
+
+ne.meta <- left_join(ne.dat, meta)
+
+ne.meta.out <- ne.meta %>% dplyr::select(INDV, ISLAND)
+
+#write.table(ne.meta.out, "~/Desktop/Ulit/exome/Ne/sampleMap4Ne_meta.txt", quote = FALSE, row.names=FALSE, col.names=FALSE)
+
+
+# by island and time
+ne.meta$I_T <- paste0(ne.meta$ISLAND, "_", ne.meta$TIME)
+ne.meta.out2 <- ne.meta %>% dplyr::select(INDV, I_T)
+
+#write.table(ne.meta.out2, "~/Desktop/Ulit/exome/Ne/sampleMap4Ne_metaI_T.txt", quote = FALSE, row.names=FALSE, col.names=FALSE)
+
+
+```
+
+&nbsp;
+
+#### Use the PGDSpider GUI (on PC) to convert VCF to GENEPOP format along with a pop text file just made
+```{bash, eval=FALSE, message=FALSE}
+java -Xmx1024m -Xms512m -jar ~/Desktop/PGDSpider_2.1.1.5/PGDSpider2.jar
+
+```
+
+&nbsp;
+
+#### Calculate Ne using NeEstimator
+```{bash, eval=FALSE, message=FALSE}
+ java -Xmx1024m -Xms512m -jar ~/Desktop/NeEstimator_program/NeEstimator2x1.jar
+ 
+ ## Ne for island with time periods together
+ scp adamsn23@gateway.hpcc.msu.edu:"/mnt/home/adamsn23/programs/NeEstimator/ulit_bwaAln.merged_1filter.miss75.imiss75.maf01_IDs_hz_noLD.ann.SYN.gpNe.txt" .
+```
+
+&nbsp;
+&nbsp;
+&nbsp;
+
+# 18) Evaluate any signatures of selection using association tests
+## Northern Islands -- Cochran–Mantel–Haenszel test (CMH)
+Done on dataset neither pruned for LD nor filtered by maf
+```{bash, eval=FALSE, message=FALSE}
+
+# create plink files from vcf
+~/programs/plink --vcf ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.recode.vcf.gz --allow-extra-chr --dog --double-id --make-bed --out assocTests/ulit_bwaAln.merged_1filter.miss75.imiss75
+
+# make a SNP ID column manually for.bim
+awk 'BEGIN{OFS="\t"}{print $1,$1"_"$4,$3,$4,$5,$6}' ulit_bwaAln.merged_1filter.miss75.imiss75.bim >  ulit_bwaAln.merged_1filter.miss75.imiss75.bim.tmp 
+ 
+mv ulit_bwaAln.merged_1filter.miss75.imiss75.bim.tmp ulit_bwaAln.merged_1filter.miss75.imiss75.bim 
+
+# recode to get map and ped files in order to use --keep in cmh
+~/programs/plink --bfile ulit_bwaAln.merged_1filter.miss75.imiss75 --recode12 --double-id --allow-extra-chr --dog --out ulit_bwaAln.merged_1filter.miss75.imiss75
+
+```
+
+&nbsp;
+
+### Prepare .fam file for CMH 
+```{r, warning=FALSE, message=FALSE}
+# Change the .fam file to island and 1,2 for historical vs modern 
+
+meta <- read.table("~/Desktop/Ulit/exome/Het/Sample_metadata_nolow.txt", header=TRUE)
+
+fam.at <- read.table("~/Desktop/Ulit/exome/assocTests/ulit_bwaAln.merged_1filter.miss75.imiss75.fam_og")
+
+fam.at <-  fam.at %>% rename("INDV"="V2")
+
+fam.at.meta <- left_join(fam.at, meta)
+
+fam.at.meta$TIME2 <- ifelse(fam.at.meta$TIME == "Historical", 1, 2)
+fam.at.meta$SEX2 <- ifelse(fam.at.meta$SEX == "M", 1, 2) # plink "Sex code ('1' = male, '2' = female, '0' = unknown)"
+fam.at.out <- fam.at.meta %>% dplyr::select(ISLAND, INDV, V3, V4, SEX2, TIME2)
+
+#write.table(fam.at.out, "~/Desktop/Ulit/exome/assocTests/ulit_bwaAln.merged_1filter.miss75.imiss75.fam", quote = FALSE, row.names=FALSE, col.names=FALSE)
+
+## North
+# north.at <- fam.at.meta %>% filter(ISLAND %in% c("SMI", "SRI", "SCZ"))
+# north.at.out <- north.at %>% dplyr::select(ISLAND2, INDV, TIME2)
+north.at.out <- fam.at.out %>% filter(ISLAND %in% c("SMI", "SRI", "SCZ")) %>% mutate(CLUSTER=ISLAND) %>% dplyr::select(ISLAND, INDV, CLUSTER)
+
+#write.table(north.at.out, "~/Desktop/Ulit/exome/assocTests/myCluster.bwaAln.North.dat", quote = FALSE, row.names=FALSE, col.names=FALSE)
+
+## CAT
+CAT.at <- fam.at.meta %>% filter(ISLAND %in% c("CAT"))
+CAT.at.out <- CAT.at %>% dplyr::select(TIME2, INDV, ISLAND)
+CAT.at.out <- fam.at.out %>% filter(ISLAND %in% c("CAT")) %>% mutate(CLUSTER=ISLAND) %>% dplyr::select(ISLAND, INDV, CLUSTER)
+
+#write.table(CAT.at.out, "~/Desktop/Ulit/exome/assocTests/myCluster.bwaAln.CAT.dat", quote = FALSE, row.names=FALSE, col.names=FALSE)
+
+```
+
+&nbsp;
+
+### Run CMH in Plink
+```{bash, eval=FALSE, message=FALSE}
+# run
+~/programs/plink --bfile ulit_bwaAln.merged_1filter.miss75.imiss75 --dog --allow-extra-chr --allow-no-sex --mh --out ulit_bwaAln.merged_1filter.miss75.imiss75.North --adjust --within myCluster.bwaAln.North.dat
+
+# combine the two outputs and fix columns
+cat ulit_bwaAln.merged_1filter.miss75.imiss75.North.cmh | awk '{print $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12}' OFS='\t' > ulit_bwaAln.merged_1filter.miss75.imiss75.North.cmh.tab
+
+awk 'BEGIN{OFS="\t"}FNR==NR{a[$2]=$3"\t"$4"\t"$5"\t"$6"\t"$7"\t"$8"\t"$9"\t"$10;next} ($2 in a) {print $0,a[$2]}' ulit_bwaAln.merged_1filter.miss75.imiss75.North.cmh.adjusted ulit_bwaAln.merged_1filter.miss75.imiss75.North.cmh.tab > ulit_bwaAln.merged_1filter.miss75.imiss75.North.cmh.final 
+
+scp adamsne2@bridges2.psc.xsede.org:"/ocean/projects/mcb200015p/adamsne2/UlitExome/bwaAln_analyses/assocTests/ulit_bwaAln.merged_1filter.miss75.imiss75.North.cmh.final" .
+
+
+```
+
+&nbsp;
+
+#### Plot CMH in Rstudio -- Figure S7 B
+```{r, warning=FALSE, message=FALSE}
+North.cmh <- read.delim("~/Desktop/Ulit/exome/assocTests/ulit_bwaAln.merged_1filter.miss75.imiss75.North.cmh.final", header=TRUE)
+
+# look for sig SNPs in full dataset
+snpsOfInterestx <- North.cmh %>%
+  filter(FDR_BH <  0.05) %>% arrange(FDR_BH) #N=117
+
+bonf.snps <- North.cmh %>%
+  filter(BONF <  0.05) %>% arrange(FDR_BH) #N=4
+
+
+chr2keep <- c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32", "33", "34", "35", "36", "37", "38")
+
+North.cmh2 <- North.cmh %>% filter(CHR %in% chr2keep)
+
+North.cmh2$CHR <- factor(North.cmh2$CHR, levels=c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32", "33", "34", "35", "36", "37", "38"))
+
+North.cmh2$CHR <- as.numeric(North.cmh2$CHR)
+
+North.cmh.sub <- North.cmh2 %>% 
+  filter(-log10(P)>1)
+#North.cmh.sub <- North.cmh.sub[complete.cases(North.cmh.sub),]
+
+#Calculate number of SNPs and new Bonferroni corrected p-value threshold : divide current threshold p-value (0.05) by the number of SNPs
+# New Bonferroni p-value
+# print(0.05/length(North.cmh$SNP)) # 3.722218e-08
+
+# Northern Islands
+# snpsOfInterest <- North.cmh.sub %>%
+#   filter(P < 3.722218e-08) %>% 
+#   magrittr::extract2(2)
+
+
+# highlight sig snps for plot (only main chrs)
+snpsOfInterest <- North.cmh.sub %>%
+  filter(FDR_BH < 0.05) %>% arrange(UNADJ) 
+  #magrittr::extract2(2)
+
+# Prepare the dataset
+north.don <- North.cmh.sub %>% 
+  
+  # Compute chromosome size
+  group_by(CHR) %>% 
+  summarise(chr_len=max(BP)) %>% 
+  
+  # Calculate cumulative position of each chromosome
+  mutate(tot=cumsum(as.numeric(chr_len))-as.numeric(chr_len)) %>%
+  dplyr::select(-chr_len) %>%
+  
+  # Add this info to the initial dataset
+  left_join(North.cmh.sub, ., by=c("CHR"="CHR")) %>%
+  
+  # Add a cumulative position of each SNP
+  arrange(CHR, BP) %>%
+  mutate(N.cumulativeBP=BP+tot) %>%
+  
+  # Add highlight and annotation information
+  mutate( is_highlight=ifelse(SNP %in% snpsOfInterest, "yes", "no")) %>%
+  mutate( is_annotate=ifelse(-log10(P)>7.2, "yes", "no"))  # taken from -log10(1.072e-07) of the 5th smallest UNADJ P from snpsofinterest
+
+# Prepare X axis
+#north.axisdf <- north.don %>% group_by(CHR) %>% summarize(center=( max(N.cumulativeBP) + min(N.cumulativeBP) ) / 2 )
+n.axisA <- north.don %>% group_by(CHR) %>% summarize(max=max(N.cumulativeBP), min=min(N.cumulativeBP))
+n.axisB <- n.axisA %>% group_by(CHR) %>% summarize(m_m=as.numeric(max)+as.numeric(min))
+north.axisdf <- n.axisB %>% group_by(CHR) %>% summarize(center=m_m/2)
+
+# Function to get everyother chr on x axis (code from: https://community.rstudio.com/t/how-to-automatically-skip-some-x-labels/65702/3)
+everysecond <- function(x){
+  x <- sort(unique(x))
+  x[seq(2, length(x), 2)] <- ""
+  x
+}
+
+# Make the plot
+northCMH.p <- ggplot(north.don, aes(x=N.cumulativeBP, y=-log10(P))) +
+  
+  # Show all points
+  geom_point( aes(color=as.factor(CHR)), alpha=0.8, size=1.3) +
+  scale_color_manual(values = rep(c("grey", "royalblue2"), 22 )) +
+  
+  # custom X axis:
+  #scale_x_continuous( label = north.axisdf$CHR, breaks= north.axisdf$center ) +
+  scale_x_continuous( label = as.numeric(everysecond(north.axisdf$CHR)), breaks=as.numeric(everysecond(north.axisdf$center))) +
+  scale_y_continuous(expand = c(0, 0) ) +     # remove space between plot area and x axis
+  ylim(1, 8) +
+  
+  # Add highlighted points
+  geom_point(data=subset(north.don, is_highlight=="yes"), color="orange", size=2) +
+  
+  # Add label using ggrepel to avoid overlapping
+  geom_text_repel( data=subset(north.don, is_annotate=="yes"), aes(label=SNP), size=4) +
+  
+  # Custom the theme:
+  theme_bw() +  xlab("Chromosome") + ylab("-log10(p)") +
+  theme( 
+    legend.position="none",
+    panel.border = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(), 
+    text = element_text(size = 16), axis.text.x = element_text(size = 14)
+  )
+
+northCMH.p2 <- cowplot::plot_grid(northCMH.p, labels = c("B"), label_size = 16, ncol=1)
+
+#ggsave(northCMH.p2, filename="~/Desktop/Ulit/exome/assocTests/north_cmhPlot_2-16-23.png", width=11, height=8, units="in")
+
+
+
+snps.out <- snpsOfInterest %>% dplyr::select(CHR, BP)
+snps.out$CHR <- paste("chr", snps.out$CHR, sep="")
+
+# write.table(snps.out, "~/Desktop/Ulit/exome/assocTests/north.cmh.snps.txt", quote = FALSE, row.names=FALSE, col.names=FALSE, sep = '\t') 
+
+northCMH.p2
+
+```
+
+&nbsp;
+
+## CAT -- Fisher's exact test
+```{bash, eval=FALSE, message=FALSE}
+# use keep for CAT
+cat myCluster.bwaAln.CAT.dat | awk '{print $1, $2}' OFS=" " > myCluster.bwaAln.CAT.dat2
+
+~/programs/plink --bfile ulit_bwaAln.merged_1filter.miss75.imiss75 --dog --allow-extra-chr --allow-no-sex --assoc fisher --out ulit_bwaAln.merged_1filter.miss75.imiss75.CAT --adjust --keep myCluster.bwaAln.CAT.dat2 
+
+# combine the two outputs and fix columns
+awk 'BEGIN{OFS="\t"}FNR==NR{a[$2]=$3"\t"$4"\t"$5"\t"$6"\t"$7"\t"$8"\t"$9"\t"$10;next} ($2 in a) {print $0,a[$2]}' ulit_bwaAln.merged_1filter.miss75.imiss75.CAT.assoc.fisher.adjusted ulit_bwaAln.merged_1filter.miss75.imiss75.CAT.assoc.fisher > ulit_bwaAln.merged_1filter.miss75.imiss75.CAT.assoc.fisher.final 
+
+scp adamsne2@bridges2.psc.xsede.org:"/ocean/projects/mcb200015p/adamsne2/UlitExome/bwaAln_analyses/assocTests/ulit_bwaAln.merged_1filter.miss75.imiss75.CAT.assoc.fisher.final" .
+
+```
+
+&nbsp;
+
+### Plot CAT Fisher's exact in Rstudio
+```{r, warning=FALSE, message=FALSE, eval=FALSE}
+library(ggrepel)
+
+CAT.cmh <- (read.table("~/Desktop/Ulit/exome/assocTests/ulit_bwaAln.merged_1filter.miss75.imiss75.CAT.assoc.fisher.final", header=TRUE))
+
+# look for sig SNPs in full dataset
+snpsOfInterest2x <- CAT.cmh %>%
+  filter(FDR_BH <=  0.05)
+
+CAT.cmh %>% filter(UNADJ <= 0.05) %>% arrange(UNADJ) # nada
+
+
+chr2keep <- c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32", "33", "34", "35", "36", "37", "38")
+
+CAT.cmh2 <- CAT.cmh %>% filter(CHR %in% chr2keep)
+
+CAT.cmh2$CHR <- factor(CAT.cmh2$CHR, levels=c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32", "33", "34", "35", "36", "37", "38"))
+
+CAT.cmh2$CHR <- as.numeric(CAT.cmh2$CHR)
+
+CAT.cmh.sub <- CAT.cmh2 %>% 
+  filter(-log10(P)>1)
+
+#CAT.cmh.sub <- CAT.cmh.sub[complete.cases(CAT.cmh.sub),]
+
+# New Bonferroni p-value
+# print(0.05/length(CAT.cmh$SNP)) # 1.510403e-09
+# 
+# snpsOfInterest2 <- CAT.cmh.sub %>%
+#   filter(P <  1.510403e-09) %>%
+#   magrittr::extract2(2) %>% droplevels()
+
+
+# get sig SNPs to highlight in plot (only main chr)
+snpsOfInterest2 <- CAT.cmh.sub %>%
+  filter(FDR_BH <  0.05)
+  #magrittr::extract2(2) %>% droplevels()
+
+
+# Function to get everyother chr on x axis (code from: https://community.rstudio.com/t/how-to-automatically-skip-some-x-labels/65702/3)
+everysecond <- function(x){
+  x <- sort(unique(x))
+  x[seq(2, length(x), 2)] <- ""
+  x
+}
+
+# Prepare the dataset
+don2 <- CAT.cmh.sub %>% 
+  
+  # Compute chromosome size
+  group_by(CHR) %>% 
+  dplyr::summarise(chr_len=max(BP)) %>% 
+  
+  # Calculate cumulative position of each chromosome
+  mutate(tot=cumsum(as.numeric(chr_len))-as.numeric(chr_len)) %>%
+  dplyr::select(-chr_len) %>%
+  
+  # Add this info to the initial dataset
+  left_join(CAT.cmh.sub, ., by=c("CHR"="CHR")) %>%
+  
+  # Add a cumulative position of each SNP
+  arrange(CHR, BP) %>%
+  mutate( cumulativeBP=BP+tot) %>%
+  
+  # Add highlight and annotation information
+  mutate( is_highlight=ifelse(SNP %in% snpsOfInterest2, "yes", "no")) %>%
+  mutate( is_annotate=ifelse(-log10(P)>8, "yes", "no")) 
+
+# Prepare X axis
+#axisdf2 <- don2 %>% group_by(CHR) %>% summarize(center=( max(cumulativeBP) + min(cumulativeBP) ) / 2 )
+axisA <- don2 %>% group_by(CHR) %>% summarize(max=max(cumulativeBP), min=min(cumulativeBP))
+axisB <- axisA %>% group_by(CHR) %>% summarize(m_m=as.numeric(max)+as.numeric(min))
+axisdf2 <- axisB %>% group_by(CHR) %>% summarize(center=m_m/2)
+
+# Make the plot
+catCMH.p <- ggplot(don2, aes(x=cumulativeBP, y=-log10(P))) +
+  
+  # Show all points
+  geom_point( aes(color=as.factor(CHR)), alpha=0.8, size=1.3) +
+  scale_color_manual(values = rep(c("grey", "darkred"), 22 )) +
+  
+  # custom X axis:
+  scale_x_continuous( label = as.numeric(everysecond(axisdf2$CHR)), breaks= as.numeric(everysecond(axisdf2$center ))) +
+  scale_y_continuous(expand = c(0, 0) ) +     # remove space between plot area and x axis
+  ylim(1, 9.5) +
+  
+  # Add highlighted points
+  geom_point(data=subset(don2, is_highlight=="yes"), color="orange", size=2) +
+  
+  # Add label using ggrepel to avoid overlapping
+  geom_text_repel( data=subset(don2, is_annotate=="yes"), aes(label=SNP), size=4) +
+  
+  # Custom the theme:
+  theme_bw() + xlab("Chromosome") + ylab("-log10(p)") +
+  theme( 
+    legend.position="none",
+    panel.border = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    text = element_text(size = 16), axis.text.x = element_text(size = 14)
+  )
+ 
+# cowplot::plot_grid(northCMH.p, catCMH.p, labels = c("C", "D"), label_size = 16, ncol=1)
+catFish.p2 <- cowplot::plot_grid(catCMH.p, label_size = 16, ncol=1)
+
+
+#ggsave(catFish.p2, filename="~/Desktop/Ulit/exome/assocTests/cat_cmhPlot_2-16-23.png", width=11, height=8, units="in")
+
+```
+
+&nbsp;
+
+#### Plot assiciation tests dispersion in Rstudio -- Figure S7 A
+```{r, warning=FALSE, message=FALSE, eval=FALSE}
+#library(gap)
+
+north.q <- function() { par( 
+  mar = c(3, 3, 1, 1), 
+  mgp = c(2, 1, 0) ) 
+  gcontrol2(North.cmh$P,col="black",lcol="steelblue", cex.axis=1.5, cex.lab=1.5) } 
+
+
+#ggsave(north.q, filename="~/Desktop/Ulit/exome/assocTests/north_qPlot_2-16-23.png", width=10, height=6, units="in")
+
+
+# get lambda overdispersion values
+north.r <- gcontrol2(North.cmh$P)
+ print(north.r$lambda) 
+
+north.q
+
+```
+
+&nbsp;
+
+### Get allele frequencies for significant SNPs -- part of Table 2
+```{bash, eval=FALSE, message=FALSE}
+# 1) split CMH vcf into island and time and keep only sig SNPs (North)
+cd assocTests/
+# modern samples
+for FILE in ../*M.txt; do popT=`ls $FILE | cut -f2 -d '/' | cut -f1 -d '.'`; vcftools --gzvcf ../../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.recode.vcf.gz --keep $FILE --positions north.cmh.snps.txt --recode --recode-INFO-all --out ulit_bwaAln.merged_1filter.miss75.imiss75_$popT\.sigSnps; done
+
+# historical samples
+for FILE in ../*fix.txt; do popT=`ls $FILE| cut -f2 -d '/' | cut -f1 -d '.'`; vcftools --gzvcf ../../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.recode.vcf.gz --keep $FILE --positions north.cmh.snps.txt --recode --recode-INFO-all --out ulit_bwaAln.merged_1filter.miss75.imiss75_$popT\.sigSnps; done
+
+for FILE in *sigSnps.recode.vcf; do bgzip -c $FILE > $FILE.gz; done 
+
+# 2) get allele freq
+for FILE in *sigSnps.recode.vcf 
+do 
+vcftools --vcf $FILE --freq --out ${FILE%.recode.vcf}.frq 
+done 
+
+
+grep "78535562" ulit_bwaAln.merged_1filter.miss75.imiss75_SCZ_H.sigSnps.frq.frq
+grep "78535562" ulit_bwaAln.merged_1filter.miss75.imiss75_SCZ_M.sigSnps.frq.frq
+
+grep "78536659" ulit_bwaAln.merged_1filter.miss75.imiss75_SCZ_H.sigSnps.frq.frq
+grep "78536659" ulit_bwaAln.merged_1filter.miss75.imiss75_SCZ_M.sigSnps.frq.frq
+
+grep "78536837" ulit_bwaAln.merged_1filter.miss75.imiss75_SCZ_H.sigSnps.frq.frq
+grep "78536837" ulit_bwaAln.merged_1filter.miss75.imiss75_SCZ_M.sigSnps.frq.frq
+
+grep "1873903" ulit_bwaAln.merged_1filter.miss75.imiss75_SCZ_H.sigSnps.frq.frq
+grep "1873903" ulit_bwaAln.merged_1filter.miss75.imiss75_SCZ_M.sigSnps.frq.frq
+
+```
+
+&nbsp;
+&nbsp;
+&nbsp;
+
+### Get synon vs nonsynon in overall dataset
+```{bash, eval=FALSE, message=FALSE}
+~/programs/jdk-11/bin/java -Xmx4g -Xms4g -jar ~/programs/snpEff/snpEff.jar CanFam3.1.99 ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.recode.vcf.gz -stats ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.html > ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.ann.vcf
+
+# .ann.vcf has 3721302 snps
+
+~/programs/jdk-11/bin/java -jar ~/programs/snpEff/SnpSift.jar filter "(ANN[*].EFFECT has 'synonymous_variant')" ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.ann.vcf > ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.ann.SYN.vcf 
+
+grep -v "^##" ../bwaAln_vcfs/ulit_bwaAln.merged_1filter.miss75.imiss75.ann.SYN.vcf
+
+# 277360 snps
+
+# !!!! To get estimates of syn and nonsyn variants use the .html summary output from snpEff !!!!
+# ulit_bwaAln.merged_1filter.miss75.imiss75.html
+
+```
+
+&nbsp;
+
+# Manuscript figures
+## Sample map -- Figure 1
+```{r, warning=FALSE, message=FALSE}
+# https://github.com/tidyverse/ggplot2/issues/2322
+
+mapdata <- getData("GADM", country = "usa", level = 1)
+mymap <- fortify(mapdata)
+
+# cols changed on 5/25/2021, previous to that SNI was coral2
+cols <- c("SMI" = "midnightblue", "SRI" = "royalblue2", "SCZ" = "cadetblue2", "CAT" = "darkred", "SCL" = "firebrick1", "SNI" = "darksalmon", "SBZ" = "darkgreen", "OCZ" = "green2", "CALM" = "springgreen2", "GRAY" = "gray42")
+
+
+g1 <- ggplot() +
+      geom_blank(data = mymap, aes(x=long, y=lat)) +
+      geom_map(data = mymap, map = mymap, 
+               aes(group = group, map_id = id),
+               fill = "#b2b2b2", color="gray45", size = 0.3) +
+      geom_point(data = mydata, mapping = aes(x = Long, y = Lat, fill= ISLAND, shape=Time), alpha=0.85, size =8, inherit.aes=TRUE) +
+      scale_fill_manual(values = cols) +
+      scale_shape_manual(values=c(21, 24)) +
+      guides(fill = FALSE) +
+      scale_x_continuous(limits = c(-120.7, -118.1), expand = c(0, 0)) +
+      scale_y_continuous(limits = c(32.55, 34.55), expand = c(0, 0)) +
+      theme_map() +
+      theme(legend.title=element_text(size=20), legend.text=element_text(size=15)) +
+      scalebar(location = "bottomleft", dist = 25, dist_unit = "km",
+               transform = TRUE, model = 'WGS84',
+               x.min = -119, x.max = -120,
+               y.min = 32.71, y.max = 33.6, st.dist = 0.05) +
+      north(x.min = -120.7, x.max = -120.5,
+            y.min = 34.25, y.max = 34.5,
+            location = "toprgiht", scale = 0.1) +
+  annotate("text", x = -120.35, y = 34.24, label = "San Miguel \n (SMI*)\n N(H): 4\n N(M): 13", size=6) +
+  annotate("text", x = -120.12, y = 33.74, label = "Santa Rosa \n (SRI*)\n N(H): 4\n N(M): 9", size=6) +
+  annotate("text", x = -119.5, y = 33.84, label = "Santa Cruz \n (SCZ*)\n N(H): 6\n N(M): 3", size=6) +
+  annotate("text", x = -118.3, y = 33.15, label = "Santa Catalina \n (CAT*)\n N(H): 10\n N(M): 12", size=6) +
+  annotate("text", x = -118.7, y = 32.762, label = "San Clemente \n (SCL)\n N(H): 9\n N(M): 5", size=6) +
+  annotate("text", x = -119.5, y = 33.05, label = "San Nicolas \n (SNI)\n N(H): 7\n N(M): 10", size=6)
+
+
+
+foo <- map_data("state")
+temp <- data.frame(long = c(-121, -121, -117, -117, -121), lat = c(32, 35, 35, 32, 32))
+mypoint <- data.frame(long = -119, lat = 33)
+
+
+g2 <- ggplotGrob(
+        ggplot() +
+        geom_polygon(data = foo,
+                     aes(x = long, y = lat, group = group),
+                     fill = "#b2b2b2", color = "gray45", size = 0.3) +
+        geom_path(data = temp, aes(x = long, y = lat), size = 0.8) +
+        coord_map("polyconic") +
+        theme_map() +
+        theme(panel.background = element_rect(fill = NULL))
+      )     
+
+g3 <- g1 +
+      annotation_custom(grob = g2, xmin = -118.88, xmax = -118.16,
+                        ymin = 34.05, ymax = 34.54)
+
+
+#ggsave(plot = g3, height = 8, width = 11, filename = "/Users/Nicole/Documents/Fox_lab/MHC_sequencing/ms_drafts/Fig1_map_fxdScale_N.png")
+
+g3
+
+```
+
+&nbsp;
+
+## Put pi, het, mds figs together -- Figure 2
+```{r, warning=FALSE, message=FALSE}
+
+col1.2 <- cowplot::plot_grid(het.box2, mds.x, labels = c("B", "C"), ncol = 1)
+#cowplot::plot_grid(pixy.den.p, col1.2, labels = c("A", ""), label_size = 16)
+
+#jpeg(filename="/Users/Nicole/Documents/Fox_lab/MHC_sequencing/ms_drafts/Fig1_wArrows.jpg", units="in", width=15, height=9, res=300)
+#jpeg(filename="~/Desktop/Ulit/exome/Fig1_wArrows_2-6-2023.jpg", units="in", width=15, height=9, res=300)
+#jpeg(filename="~/Desktop/Ulit/exome/Fig1_wArrows_noMaf_2-11-2023.jpg", units="in", width=15, height=9, res=300)
+# jpeg(filename="~/Desktop/Ulit/exome/Fig2_pixyPi_4-25-2023.jpg", units="in", width=15, height=9, res=300)
+# cowplot::plot_grid(pixy.den.p, col1.2, labels = c("A", ""), label_size = 16)
+# dev.off()
+# dev.off()
+
+cowplot::plot_grid(pixy.den.p, col1.2, labels = c("A", ""), label_size = 16)
+
+```
